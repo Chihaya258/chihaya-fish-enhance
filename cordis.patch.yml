@@ -1,0 +1,14 @@
+- insert:
+    - id: qzone-diary
+      name: '@local/qzone-diary'
+      config:
+        bridgeRoot: /opt/qq-bridge
+        publishEnabled: false
+        intervalHours: 8
+        randomJitterMinutes: 180
+        maxPerDay: 3
+        maxChars: 100
+        visibility: 4
+        sourceKeys: []
+        adminSessionIds: []
+        prompt: ''

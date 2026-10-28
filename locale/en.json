@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "QQ Space Diary",
+    "description": "Drafts diary entries from the bot's recent messages; optional scheduled publishing is disabled by default and friends-only."
+  }
+}
