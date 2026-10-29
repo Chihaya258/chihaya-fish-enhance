@@ -3,7 +3,7 @@
   "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "从机器人近期发言整理 QQ 空间日记草稿，并在启用后按计划发布。带设置页。",
+  "description": "QQ 机器人加强插件，当前包含 QQ 空间随笔功能，并支持继续扩展更多机器人能力。带设置页。",
   "main": "index.js",
   "exports": {
     ".": "./index.js",

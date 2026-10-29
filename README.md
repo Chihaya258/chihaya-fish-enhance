@@ -1,6 +1,6 @@
-# qzone-diary（QQ 空间随笔）
+# chihaya-fish-enhance（QQ 机器人加强插件）
 
-让 QQ 机器人从自己的近期发言里，自动整理一两句「QQ 空间随笔」草稿；启用发布后，按「值得发送程度」的概率掷骰决定发不发。带 Web 设置页。
+面向 QQ 机器人的可扩展加强插件。目前已包含「QQ 空间随笔」功能：让机器人从自己的近期发言里，自动整理一两句草稿；启用发布后，按「值得发送程度」的概率掷骰决定发不发。Web 设置页已按功能拆分，后续可继续添加更多机器人能力。
 
 > 仅供上传/分发准备用的源码快照，不含 `node_modules`。
 
@@ -27,7 +27,7 @@
 ```
 qzone-diary/
 ├── index.js            # 宿主端：模型工具 + 调度循环 + HTTP 设置页 API
-├── client.js           # 客户端：设置页面板（slots 注入 settings.section）
+├── client.js           # 客户端：机器人加强插件设置页（功能总览 + QQ 空间子菜单）
 ├── cordis.patch.yml    # bundle 补丁：注册插件并写入默认配置
 ├── icon.svg            # 插件图标
 ├── package.json        # 包元信息（name: @local/qzone-diary）

@@ -52,6 +52,13 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
 [data-qzd-pre]{margin:6px 0 0;padding:8px 9px;border-radius:8px;max-height:200px;overflow:auto;font-size:11px;
   line-height:15px;white-space:pre-wrap;word-break:break-all;
   background:var(--dsw-alias-bg-overlay,rgba(0,0,0,.25));color:var(--dsw-alias-label-secondary,#c9ccd1);}
+[data-qzd-nav]{display:flex;gap:6px;flex-wrap:wrap;padding-bottom:4px;border-bottom:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));}
+[data-qzd-tab]{padding:7px 11px;border:0;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary,#c9ccd1);cursor:pointer;font:inherit;font-size:12px;}
+[data-qzd-tab]:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.18));}
+[data-qzd-tab][data-active]{background:#3b82f6;color:#fff;}
+[data-qzd-feature]{display:flex;flex-direction:column;gap:12px;padding:4px 2px;}
+[data-qzd-card]{padding:12px;border-radius:10px;background:var(--dsw-alias-bg-overlay,rgba(128,128,128,.12));}
+[data-qzd-card-title]{font-size:14px;font-weight:600;margin-bottom:5px;}
 `;
 
     function Switch({ on, onChange, disabled }) {
@@ -92,6 +99,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
       const [msg, setMsg] = React.useState('');
       const [tone, setTone] = React.useState('');
       const [busy, setBusy] = React.useState('');
+      const [activeFeature, setActiveFeature] = React.useState('qzone');
 
       const say = (t, tn) => { setMsg(t); setTone(tn || ''); };
 
@@ -156,7 +164,22 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
 
       return h('div', { 'data-qzd-page': '' },
         h('style', null, CSS),
-
+        h('nav', { 'data-qzd-nav': '', 'aria-label': '机器人功能' },
+          h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'qzone' ? '' : undefined, onClick: () => setActiveFeature('qzone') }, 'QQ 空间'),
+          h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'overview' ? '' : undefined, onClick: () => setActiveFeature('overview') }, '功能总览'),
+        ),
+        activeFeature === 'overview' ? h('div', { 'data-qzd-feature': '' },
+          h('div', { 'data-qzd-card': '' },
+            h('div', { 'data-qzd-card-title': '' }, 'QQ 机器人加强插件'),
+            h('div', { 'data-qzd-note': '' }, '这里将集中管理机器人的扩展功能。当前已接入 QQ 空间，后续可继续添加消息、群管理、定时任务等功能。'),
+          ),
+          h('div', { 'data-qzd-card': '' },
+            h('div', { 'data-qzd-card-title': '' }, '当前功能'),
+            h('div', { 'data-qzd-label': '' }, 'QQ 空间随笔'),
+            h('div', { 'data-qzd-note': '' }, '从机器人近期发言整理随笔草稿，并按计划和概率发布。'),
+          ),
+        ) : null,
+        activeFeature !== 'qzone' ? null : h(React.Fragment, null,
         h('div', { 'data-qzd-row': '' },
           h('span', { 'data-qzd-badge': '' }, `今天已发 ${st.todayPosts ?? 0} / ${cfg.maxPerDay} 条`),
           h('span', { 'data-qzd-badge': '' }, `累计 ${st.totalPosts ?? 0} 条`),
@@ -232,6 +255,8 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
                 h('button', { 'data-qzd-btn': '', 'data-primary': '', disabled: busy === 'publish' || !cfg.publishEnabled, onClick: () => onPublish(d.id) },
                   busy === 'publish' ? '发布中…' : '发布这条'))))) : null),
 
+        ),
+
         msg ? h('div', { 'data-qzd-msg': '', 'data-good': tone === 'good' ? '' : undefined, 'data-warn': tone === 'warn' ? '' : undefined }, msg) : null,
       );
     }
@@ -241,7 +266,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
       apply(ctx) {
         const slots = ctx.get('slots');
         slots.inject('settings.section', () => slots.register(
-          { name: 'settings.section', id: 'qzone-diary', order: 55, label: 'QQ空间随笔' },
+          { name: 'settings.section', id: 'qzone-diary', order: 55, label: 'QQ机器人加强插件' },
           () => h(Panel),
         ));
       },
