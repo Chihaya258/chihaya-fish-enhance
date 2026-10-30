@@ -21,9 +21,23 @@ export const Config = z.object({
   proactiveEnabled: z.boolean().default(false).description('主动回复总开关'),
   proactiveTargetSessions: z.array(z.string()).default([]).description('主动回复的目标 DSH 会话 ID'),
   proactiveIntervalMin: z.number().min(1).max(1440).default(30).description('主动回复基础间隔（分钟）'),
-  proactiveChance: z.number().step(1).min(0).max(100).default(50).description('到点掷骰命中线（0~100，≤此值才回复）'),
+  proactiveEvalEnabled: z.boolean().default(true).description('每轮对话后用大模型评估完毕性/紧急性，据此缩短主动回复间隔'),
+  proactiveEvalShrink: z.number().min(0).max(100).default(70).description('评估缩短幅度（%）：综合分 1 时间隔缩到基础间隔的 (100-该值)%'),
+  proactiveChance: z.number().step(1).min(0).max(100).default(50).description('谷时命中线（0~100，掷到以下才回复）'),
+  proactivePeakChance: z.number().step(1).min(0).max(100).default(20).description('峰时命中线（0~100；周一~五 9-12/14-18 点为峰时）'),
+  proactivePeakTz: z.string().max(64).default('').description('峰谷判断时区（IANA 名，留空=本机时区）'),
+  proactiveMissBonus: z.number().step(1).min(0).max(100).default(10).description('没掷中加成：每没中一次命中线加多少'),
+  proactiveMissBonusMax: z.number().step(1).min(0).max(100).default(40).description('没中加成上限'),
+  proactiveQuietStart: z.number().step(1).min(0).max(23).default(1).description('安静时段起（小时，含起；=止表示不启用）'),
+  proactiveQuietEnd: z.number().step(1).min(0).max(23).default(8).description('安静时段止（小时，不含止）'),
+  proactiveNearMin: z.number().min(1).max(1440).default(20).description('距对方上次说话小于此分钟 → 命中线乘近因子'),
+  proactiveNearFactor: z.number().min(0).max(10).default(0.15).description('近因子（刚说过话→少开口）'),
+  proactiveFarMin: z.number().min(1).max(10080).default(360).description('距对方上次说话大于此分钟 → 命中线乘远因子'),
+  proactiveFarFactor: z.number().min(0).max(10).default(1.5).description('远因子（很久没说话→多开口）'),
+  proactiveCooldownMin: z.number().min(0).max(1440).default(20).description('自己开口后的冷却分钟（0=不冷却）'),
+  proactiveTriggerText: z.string().max(500).default('对方刚说的话告一段落，你现在想主动接一句。基于刚才的对话自然回应，别突兀、别重复、别没话找话。').description('触发文案（将作为「你自己的念头」送进会话）'),
+  proactivePrompt: z.string().max(2000).default('').description('主动回复风格补充（追加在触发文案后）'),
   proactiveDryRun: z.boolean().default(true).description('主动回复试运行：只记账不真发'),
-  proactivePrompt: z.string().max(2000).default('').description('主动回复触发文案补充'),
 });
 
 export function dayKey(time) {
@@ -89,7 +103,7 @@ export function apply(ctx, rawConfig) {
   fs.accessSync(path.dirname(statePath), fs.constants.W_OK);
 
   // ── 配置：cordis 默认 → 磁盘 JSON（旧字段映射）──
-  const HOT_KEYS = ['publishEnabled', 'intervalHours', 'randomJitterMinutes', 'maxPerDay', 'maxChars', 'visibility', 'sourceKeys', 'adminSessionIds', 'prompt', 'proactiveEnabled', 'proactiveTargetSessions', 'proactiveIntervalMin', 'proactiveChance', 'proactiveDryRun', 'proactivePrompt'];
+  const HOT_KEYS = ['publishEnabled', 'intervalHours', 'randomJitterMinutes', 'maxPerDay', 'maxChars', 'visibility', 'sourceKeys', 'adminSessionIds', 'prompt', 'proactiveEnabled', 'proactiveTargetSessions', 'proactiveIntervalMin', 'proactiveEvalEnabled', 'proactiveEvalShrink', 'proactiveChance', 'proactivePeakChance', 'proactivePeakTz', 'proactiveMissBonus', 'proactiveMissBonusMax', 'proactiveQuietStart', 'proactiveQuietEnd', 'proactiveNearMin', 'proactiveNearFactor', 'proactiveFarMin', 'proactiveFarFactor', 'proactiveCooldownMin', 'proactiveTriggerText', 'proactivePrompt', 'proactiveDryRun'];
   const persisted = load(configPath, {});
   const config = {
     bridgeRoot: cordisConfig.bridgeRoot,
@@ -107,7 +121,7 @@ export function apply(ctx, rawConfig) {
 
   // ── 主动回复状态 ──
   const proactiveStatePath = path.join(cordisConfig.bridgeRoot, 'state/qzone-proactive.json');
-  const proactiveInitial = { lastEval: null, lastProactiveAt: null, nextProactiveAt: null, lastError: null, log: [] };
+  const proactiveInitial = { lastEval: null, lastProactiveAt: null, nextProactiveAt: null, lastError: null, log: [], evaluatedSessions: {} };
   let proactiveState = load(proactiveStatePath, proactiveInitial);
   if (!Array.isArray(proactiveState.log)) proactiveState.log = [];
   const persistProactive = () => save(proactiveStatePath, proactiveState);
@@ -137,6 +151,7 @@ export function apply(ctx, rawConfig) {
   }
   let busy = false;
   let disposed = false;
+  let proactiveMissStreak = 0; // 连着几次没掷中（先声明，status() 会读）
   const abort = new AbortController();
   let active = Promise.resolve();
   const persist = () => save(statePath, state);
@@ -154,7 +169,14 @@ export function apply(ctx, rawConfig) {
       enabled: config.proactiveEnabled,
       dryRun: config.proactiveDryRun,
       intervalMin: config.proactiveIntervalMin,
+      evalEnabled: config.proactiveEvalEnabled,
+      evalShrink: config.proactiveEvalShrink,
+      effectiveIntervalMin: Math.round(computeIntervalMs(effectiveScore()) / 60000),
       chance: config.proactiveChance,
+      peakChance: config.proactivePeakChance,
+      nowPeak: isPeak(new Date(), config.proactivePeakTz),
+      quiet: inQuietHours(new Date()),
+      missStreak: proactiveMissStreak,
       targetSessions: config.proactiveTargetSessions,
       lastEval: proactiveState.lastEval,
       lastProactiveAt: proactiveState.lastProactiveAt ? new Date(proactiveState.lastProactiveAt).toISOString() : null,
@@ -330,6 +352,8 @@ export function apply(ctx, rawConfig) {
     const beforeJitter = config.randomJitterMinutes;
     const beforeProactiveInterval = config.proactiveIntervalMin;
     const beforeProactiveEnabled = config.proactiveEnabled;
+    const beforeEvalEnabled = config.proactiveEvalEnabled;
+    const beforeEvalShrink = config.proactiveEvalShrink;
     for (const k of HOT_KEYS) {
       if (patch[k] !== undefined) config[k] = patch[k];
     }
@@ -344,7 +368,10 @@ export function apply(ctx, rawConfig) {
         persist();
       } finally { release(); }
     }
-    if (config.proactiveIntervalMin !== beforeProactiveInterval || config.proactiveEnabled !== beforeProactiveEnabled) {
+    if (config.proactiveIntervalMin !== beforeProactiveInterval
+      || config.proactiveEnabled !== beforeProactiveEnabled
+      || config.proactiveEvalEnabled !== beforeEvalEnabled
+      || config.proactiveEvalShrink !== beforeEvalShrink) {
       rescheduleProactive();
     }
   };
@@ -632,15 +659,71 @@ export function apply(ctx, rawConfig) {
   function craftUserMessage(text) {
     return { id: randomUUID(), role: 'user', content: [{ type: 'text', text: String(text) }], source: { kind: 源标记 } };
   }
+  // 评估未启用时一律按基础间隔，不因分数缩短
+  function effectiveScore() {
+    if (!config.proactiveEvalEnabled) return 0;
+    const e = proactiveState.lastEval;
+    if (!e || typeof e.score !== 'number' || !Number.isFinite(e.score)) return 0;
+    return Math.max(0, Math.min(1, e.score));
+  }
   function computeIntervalMs(score) {
     const s = typeof score === 'number' && Number.isFinite(score) ? Math.max(0, Math.min(1, score)) : 0;
-    const factor = 1 - 0.7 * s; // score 0 → 1.0 倍，score 1 → 0.3 倍
+    const shrink = Math.max(0, Math.min(100, Number(config.proactiveEvalShrink) || 0)) / 100;
+    const factor = 1 - shrink * s; // score 0 → 1.0 倍，score 1 → (1-shrink) 倍
     return Math.max(60000, Math.round(config.proactiveIntervalMin * 60000 * factor));
+  }
+
+  // ── 峰谷分时（时段写死，参考 dsh-speak-up：周一~五 9-12 / 14-18 为峰时，其余含周末全为谷时）──
+  function normalizeTz(v) {
+    const s = String(v == null ? '' : v).trim().slice(0, 64);
+    if (!s || !/^[A-Za-z][A-Za-z0-9_+-]*(\/[A-Za-z0-9_+-]+)*$/.test(s)) return '';
+    try { new Intl.DateTimeFormat('en-US', { timeZone: s }); return s; } catch { return ''; }
+  }
+  function weekdayAndMinute(at, tz) {
+    const name = normalizeTz(tz);
+    const d = at instanceof Date ? at : new Date(at);
+    const local = () => ({ dow: d.getDay(), min: d.getHours() * 60 + d.getMinutes() });
+    if (!name) return local();
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', { timeZone: name, weekday: 'short', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(d);
+      const get = (t) => { const x = parts.find(p => p.type === t); return x ? x.value : ''; };
+      const dowMap = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+      const dow = dowMap[get('weekday')];
+      const hh = Number(get('hour')) % 24;
+      const mm = Number(get('minute'));
+      if (dow === undefined || !Number.isFinite(hh) || !Number.isFinite(mm)) return local();
+      return { dow, min: hh * 60 + mm };
+    } catch { return local(); }
+  }
+  function isPeak(at, tz) {
+    const { dow, min } = weekdayAndMinute(at, tz);
+    if (dow === 0 || dow === 6) return false; // 周末全天谷时
+    return (min >= 9 * 60 && min < 12 * 60) || (min >= 14 * 60 && min < 18 * 60);
+  }
+  function inQuietHours(at) {
+    const s = Math.round(config.proactiveQuietStart), e = Math.round(config.proactiveQuietEnd);
+    if (s === e) return false; // 起===止 = 不启用
+    const h = at.getHours();
+    if (s < e) return h >= s && h < e;
+    return h >= s || h < e; // 跨午夜
+  }
+
+  // ── 命中线计算：档位命中线 × 时机因子 + 没中加成，夹 0~100（先乘因子再加加成）──
+  function computeChanceLine(at, sinceUserMin) {
+    const peak = isPeak(at, config.proactivePeakTz);
+    const base = peak ? config.proactivePeakChance : config.proactiveChance;
+    let factor = 1;
+    if (Number.isFinite(sinceUserMin)) {
+      if (sinceUserMin < config.proactiveNearMin) factor = config.proactiveNearFactor;
+      else if (sinceUserMin > config.proactiveFarMin) factor = config.proactiveFarFactor;
+    }
+    const bonus = Math.min(config.proactiveMissBonusMax, proactiveMissStreak * config.proactiveMissBonus);
+    const line = Math.min(100, Math.max(0, base * factor + bonus));
+    return { peak, base, factor, bonus, line };
   }
   function rescheduleProactive() {
     if (!config.proactiveEnabled) { proactiveState.nextProactiveAt = null; persistProactive(); return; }
-    const score = proactiveState.lastEval ? proactiveState.lastEval.score : 0;
-    proactiveState.nextProactiveAt = Date.now() + computeIntervalMs(score);
+    proactiveState.nextProactiveAt = Date.now() + computeIntervalMs(effectiveScore());
     persistProactive();
   }
 
@@ -721,10 +804,27 @@ export function apply(ctx, rawConfig) {
   }
 
   // 到点后真正执行一次「主动回复」尝试（骰子 + followup）
+  let lastSpokeAt = new Map(); // sid → 我上次主动开口的时间戳
   async function proactiveAttempt() {
     if (!config.proactiveEnabled) return;
     const targets = config.proactiveTargetSessions || [];
     if (!targets.length) return;
+    const now = new Date();
+    if (inQuietHours(now)) {
+      logProactive(`现在 ${now.getHours()} 点在安静时段（${config.proactiveQuietStart}~${config.proactiveQuietEnd}）里，这轮不动`);
+      return;
+    }
+    // 自己开口后的冷却（0 = 不冷却）
+    if (config.proactiveCooldownMin > 0) {
+      const lastOwn = Math.max(0, ...lastSpokeAt.values(), 0);
+      if (lastOwn > 0) {
+        const cooled = (Date.now() - lastOwn) / 60000;
+        if (cooled < config.proactiveCooldownMin) {
+          logProactive(`自己刚开过口（${cooled.toFixed(1)} 分钟前，冷却 ${config.proactiveCooldownMin} 分钟），这轮不重复`);
+          return;
+        }
+      }
+    }
     const arch = archivedIds();
     const available = [];
     const skipped = [];
@@ -740,22 +840,32 @@ export function apply(ctx, rawConfig) {
       return;
     }
     const pick = available[Math.floor(Math.random() * available.length)];
+
+    // 命中线 = 档位（峰/谷）× 时机因子 + 没中加成，夹 0~100
+    const sinceUserMin = recentMsgs.get(pick.id)?.slice().reverse().find(m => m.role === 'user');
+    const sinceMin = sinceUserMin && sinceUserMin.time ? (Date.now() - sinceUserMin.time) / 60000 : undefined;
+    const calc = computeChanceLine(now, sinceMin);
     const roll = Math.random() * 100;
-    if (roll > config.proactiveChance) {
-      logProactive(`没掷中 ✗ 掷出 ${roll.toFixed(1)}（命中线 ${config.proactiveChance}），本轮不回复`);
+    const 距离 = sinceMin === undefined ? '距上次说话时间不明' : `距对方上次说话 ${sinceMin.toFixed(1)} 分钟`;
+    const 等式 = `${calc.line.toFixed(1)} = ${calc.peak ? '峰时' : '谷时'}命中线 ${calc.base}% × 时机因子 ${calc.factor}（${距离}）${calc.bonus > 0 ? ` + 没中加成 ${calc.bonus.toFixed(1)}` : ''}`;
+    if (roll >= calc.line) {
+      proactiveMissStreak += 1;
+      logProactive(`没掷中 ✗ 掷出 ${roll.toFixed(1)}（命中线 ${calc.line.toFixed(1)}）｜${等式}｜下次命中线 ${(Math.min(100, calc.base * calc.factor + Math.min(config.proactiveMissBonusMax, proactiveMissStreak * config.proactiveMissBonus))).toFixed(1)}`);
       return;
     }
-    const base = '对方刚说的话告一段落，你现在想主动接一句。基于刚才的对话自然回应，别突兀、别重复、别没话找话。';
-    const thought = wrapThought(base + (config.proactivePrompt ? `\n${config.proactivePrompt}` : ''));
+    const 之前连没中 = proactiveMissStreak;
+    proactiveMissStreak = 0;
+    const thought = wrapThought((config.proactiveTriggerText || '对方刚说的话告一段落，你现在想主动接一句。基于刚才的对话自然回应，别突兀、别重复、别没话找话。') + (config.proactivePrompt ? `\n${config.proactivePrompt}` : ''));
     if (config.proactiveDryRun) {
-      logProactive(`掷中 ✓ 掷出 ${roll.toFixed(1)}，试运行：本要往「${pick.id}」送一句「${thought.replace(/\n/g, ' ')}」`);
+      logProactive(`掷中 ✓ 掷出 ${roll.toFixed(1)}（命中线 ${calc.line.toFixed(1)}）｜${等式}｜${之前连没中 > 0 ? `没中加成清零（之前连着 ${之前连没中} 次没中）` : ''}试运行：本要往「${pick.id}」送一句「${thought.replace(/\n/g, ' ')}」`);
       return;
     }
     try {
       await pick.agent.followup(craftUserMessage(thought));
+      lastSpokeAt.set(pick.id, Date.now());
       proactiveState.lastProactiveAt = Date.now();
       persistProactive();
-      logProactive(`已主动回复（${pick.id}），DSH 会照常开一轮`);
+      logProactive(`已主动回复（${pick.id}），DSH 会照常开一轮｜${等式}`);
     } catch (e) {
       proactiveState.lastError = String((e && e.message) || e).slice(0, 200);
       persistProactive();
@@ -777,6 +887,11 @@ export function apply(ctx, rawConfig) {
             const t = eventText(event, 'user');
             if (t) pushMsg(sid, 'user', t);
             pendingEval.add(sid);
+            // 对方又开口了 → 解除「本轮已评估」闸门，允许下轮再评一次
+            if (proactiveState.evaluatedSessions && proactiveState.evaluatedSessions[sid]) {
+              delete proactiveState.evaluatedSessions[sid];
+              persistProactive();
+            }
           }
         } else if (event.type === 'assistant/message') {
           const t = eventText(event, 'assistant');
@@ -785,7 +900,10 @@ export function apply(ctx, rawConfig) {
           if (!pendingEval.has(sid)) return;
           pendingEval.delete(sid);
           if (!config.proactiveEnabled) return;
+          if (!config.proactiveEvalEnabled) return;
           if (!isTarget(sid)) return;
+          // 闸门：上次评估之后对方还没再说话 → 本轮不再评估（对方一回复就清掉这个标记）
+          if (proactiveState.evaluatedSessions && proactiveState.evaluatedSessions[sid]) return;
           void (async () => {
             try {
               await backfill(sid);
@@ -793,6 +911,8 @@ export function apply(ctx, rawConfig) {
               if (!evalResult) return;
               proactiveState.lastEval = evalResult;
               proactiveState.lastError = null;
+              if (!proactiveState.evaluatedSessions) proactiveState.evaluatedSessions = {};
+              proactiveState.evaluatedSessions[sid] = true;
               // 评估后立即按新分重排下次尝试时间（仅缩短，不拉长）
               proactiveState.nextProactiveAt = Date.now() + computeIntervalMs(evalResult.score);
               persistProactive();
@@ -816,7 +936,7 @@ export function apply(ctx, rawConfig) {
     if (!Number.isFinite(proactiveState.nextProactiveAt)) return;
     if (Date.now() < proactiveState.nextProactiveAt) return;
     // 先推进下次尝试时间，避免失败后卡死
-    proactiveState.nextProactiveAt = Date.now() + computeIntervalMs(proactiveState.lastEval ? proactiveState.lastEval.score : 0);
+    proactiveState.nextProactiveAt = Date.now() + computeIntervalMs(effectiveScore());
     persistProactive();
     proactiveBusy = true;
     void proactiveAttempt()

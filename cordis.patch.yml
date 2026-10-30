@@ -15,6 +15,20 @@
         proactiveEnabled: false
         proactiveTargetSessions: []
         proactiveIntervalMin: 30
+        proactiveEvalEnabled: true
+        proactiveEvalShrink: 70
         proactiveChance: 50
-        proactiveDryRun: true
+        proactivePeakChance: 20
+        proactivePeakTz: ''
+        proactiveMissBonus: 10
+        proactiveMissBonusMax: 40
+        proactiveQuietStart: 1
+        proactiveQuietEnd: 8
+        proactiveNearMin: 20
+        proactiveNearFactor: 0.15
+        proactiveFarMin: 360
+        proactiveFarFactor: 1.5
+        proactiveCooldownMin: 20
+        proactiveTriggerText: '对方刚说的话告一段落，你现在想主动接一句。基于刚才的对话自然回应，别突兀、别重复、别没话找话。'
         proactivePrompt: ''
+        proactiveDryRun: true
