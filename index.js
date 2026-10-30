@@ -1,9 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import z from '@deepseek-ai/schemastery';
 
-export const inject = ['tools', 'llm', 'agentDefaultModel', 'webServer'];
+export const inject = ['tools', 'llm', 'agentDefaultModel', 'webServer', 'agents', 'sessions', 'sessionTitle', 'workspaceRegistry'];
 
 export const Config = z.object({
   bridgeRoot: z.string().default('/opt/qq-bridge').description('QQ 桥接目录'),
@@ -16,6 +17,13 @@ export const Config = z.object({
   visibility: z.union([z.const(1), z.const(4), z.const(64)]).default(4).description('1=公开，4=好友，64=仅自己'),
   sourceKeys: z.array(z.string().pattern(/^(private|group):\d+$/)).default([]).description('素材会话；空时只使用桥接管理员私聊'),
   prompt: z.string().max(2000).default('').description('随笔风格补充'),
+  // —— 主动回复（参考 dsh-speak-up，叠加 LLM 动态评估间隔）——
+  proactiveEnabled: z.boolean().default(false).description('主动回复总开关'),
+  proactiveTargetSessions: z.array(z.string()).default([]).description('主动回复的目标 DSH 会话 ID'),
+  proactiveIntervalMin: z.number().min(1).max(1440).default(30).description('主动回复基础间隔（分钟）'),
+  proactiveChance: z.number().step(1).min(0).max(100).default(50).description('到点掷骰命中线（0~100，≤此值才回复）'),
+  proactiveDryRun: z.boolean().default(true).description('主动回复试运行：只记账不真发'),
+  proactivePrompt: z.string().max(2000).default('').description('主动回复触发文案补充'),
 });
 
 export function dayKey(time) {
@@ -81,7 +89,7 @@ export function apply(ctx, rawConfig) {
   fs.accessSync(path.dirname(statePath), fs.constants.W_OK);
 
   // ── 配置：cordis 默认 → 磁盘 JSON（旧字段映射）──
-  const HOT_KEYS = ['publishEnabled', 'intervalHours', 'randomJitterMinutes', 'maxPerDay', 'maxChars', 'visibility', 'sourceKeys', 'adminSessionIds', 'prompt'];
+  const HOT_KEYS = ['publishEnabled', 'intervalHours', 'randomJitterMinutes', 'maxPerDay', 'maxChars', 'visibility', 'sourceKeys', 'adminSessionIds', 'prompt', 'proactiveEnabled', 'proactiveTargetSessions', 'proactiveIntervalMin', 'proactiveChance', 'proactiveDryRun', 'proactivePrompt'];
   const persisted = load(configPath, {});
   const config = {
     bridgeRoot: cordisConfig.bridgeRoot,
@@ -96,6 +104,20 @@ export function apply(ctx, rawConfig) {
   if (!Number.isFinite(state.lastAttemptAt)) state.lastAttemptAt = null;
   if (!Number.isFinite(state.nextAttemptAt)) state.nextAttemptAt = null;
   delete state.scheduleNext; delete state.activityLast; delete state.nextAt; delete state.scheduleHash;
+
+  // ── 主动回复状态 ──
+  const proactiveStatePath = path.join(cordisConfig.bridgeRoot, 'state/qzone-proactive.json');
+  const proactiveInitial = { lastEval: null, lastProactiveAt: null, nextProactiveAt: null, lastError: null, log: [] };
+  let proactiveState = load(proactiveStatePath, proactiveInitial);
+  if (!Array.isArray(proactiveState.log)) proactiveState.log = [];
+  const persistProactive = () => save(proactiveStatePath, proactiveState);
+  const logProactive = (text) => {
+    proactiveState.log.push({ at: Date.now(), text: String(text) });
+    if (proactiveState.log.length > 60) proactiveState.log = proactiveState.log.slice(-60);
+    persistProactive();
+    try { ctx.logger.info(`proactive-reply: ${String(text)}`); } catch {}
+  };
+
   const validateState = () => {
     if (!Array.isArray(state.posts) || !Array.isArray(state.drafts)) throw new Error('日记状态格式错误。');
   };
@@ -128,6 +150,18 @@ export function apply(ctx, rawConfig) {
     lastError: state.lastError,
     pending: state.pending,
     drafts: state.drafts.slice(-10),
+    proactive: {
+      enabled: config.proactiveEnabled,
+      dryRun: config.proactiveDryRun,
+      intervalMin: config.proactiveIntervalMin,
+      chance: config.proactiveChance,
+      targetSessions: config.proactiveTargetSessions,
+      lastEval: proactiveState.lastEval,
+      lastProactiveAt: proactiveState.lastProactiveAt ? new Date(proactiveState.lastProactiveAt).toISOString() : null,
+      nextProactiveAt: proactiveState.nextProactiveAt ? new Date(proactiveState.nextProactiveAt).toISOString() : null,
+      lastError: proactiveState.lastError,
+      log: (proactiveState.log || []).slice(-10),
+    },
   });
 
   // 生成：返回 { score, text }，LLM 输出 JSON
@@ -294,6 +328,8 @@ export function apply(ctx, rawConfig) {
   const applyConfigPatch = (patch) => {
     const beforeInterval = config.intervalHours;
     const beforeJitter = config.randomJitterMinutes;
+    const beforeProactiveInterval = config.proactiveIntervalMin;
+    const beforeProactiveEnabled = config.proactiveEnabled;
     for (const k of HOT_KEYS) {
       if (patch[k] !== undefined) config[k] = patch[k];
     }
@@ -308,6 +344,9 @@ export function apply(ctx, rawConfig) {
         persist();
       } finally { release(); }
     }
+    if (config.proactiveIntervalMin !== beforeProactiveInterval || config.proactiveEnabled !== beforeProactiveEnabled) {
+      rescheduleProactive();
+    }
   };
   ctx.effect(() => ctx.webServer.register({
     kind: 'prefix',
@@ -318,6 +357,9 @@ export function apply(ctx, rawConfig) {
         const p = url.pathname;
         if (req.method === 'GET' && p === '/api/qzone-diary/status') return sendJson(res, 200, { ok: true, ...status() });
         if (req.method === 'GET' && p === '/api/qzone-diary/config') return sendJson(res, 200, { ok: true, config: Object.fromEntries(HOT_KEYS.map(k => [k, config[k]])), defaults: Object.fromEntries(HOT_KEYS.map(k => [k, cordisConfig[k] ?? Config({})[k]])) });
+        if (req.method === 'GET' && p === '/api/qzone-diary/proactive-sessions') {
+          return sendJson(res, 200, { ok: true, sessions: listProactiveSessions() });
+        }
         if (req.method === 'POST' && p === '/api/qzone-diary/config') {
           const patch = await readBody(req);
           if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return sendJson(res, 400, { ok: false, error: '参数必须是对象。' });
@@ -433,5 +475,358 @@ export function apply(ctx, rawConfig) {
     }).catch(() => {});
   }, 30000);
   interval?.unref();
-  ctx.effect(() => async () => { disposed = true; abort.abort(); clearInterval(interval); await active; });
+
+  // ══════════════════════════════════════════════════════════════
+  // 主动回复（参考 dsh-speak-up，叠加 LLM 动态评估间隔）
+  // ══════════════════════════════════════════════════════════════
+  const 源标记 = 'proactive-reply';
+
+  function sessionKey(id) {
+    let s = String(id == null ? '' : id).trim();
+    if (s.startsWith('session-')) s = s.slice('session-'.length);
+    return s;
+  }
+  function isTarget(sid) {
+    return (config.proactiveTargetSessions || []).some(id => sessionKey(id) === sessionKey(sid));
+  }
+  function findAgent(id) {
+    const raw = String(id == null ? '' : id).trim();
+    if (!raw) return undefined;
+    const cands = [raw];
+    if (raw.startsWith('session-')) cands.push(raw.slice('session-'.length));
+    else cands.push('session-' + raw);
+    for (const c of cands) {
+      try { const a = ctx.agents.get(c); if (a !== undefined) return a; } catch {}
+    }
+    return undefined;
+  }
+  function archivedIds() {
+    const set = new Set();
+    try {
+      const reg = ctx.workspaceRegistry || ctx.get('workspaceRegistry');
+      for (const x of (reg && reg.archivedSessionIds) || []) set.add(String(x));
+    } catch {}
+    return set;
+  }
+  // 取一个会话的标题（标题服务优先，其次投影缓存文件，最后空串）
+  function sessionTitleOf(id) {
+    const sessions = ctx.get('sessions');
+    let session;
+    try { session = sessions && typeof sessions.get === 'function' ? sessions.get(String(id)) : undefined; } catch {}
+    try {
+      const st = ctx.get('sessionTitle');
+      if (st && typeof st.get === 'function' && session) {
+        const snap = st.get(session);
+        if (snap && typeof snap.title === 'string' && snap.title) return snap.title;
+      }
+    } catch {}
+    try {
+      const dir = process.env.DSH_HOME || path.join(homedir(), '.dsh');
+      const file = path.join(dir, 'storages', 'session_projcache', 'sessions', `${String(id)}.json`);
+      const 记 = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const title = 记 && 记.record && 记.record.rows && 记.record.rows.title;
+      if (title && typeof title.val === 'string' && title.val) return title.val;
+    } catch {}
+    return '';
+  }
+  // 盘上的会话 id（没打开标签页也在；子智能体滤掉）
+  function scanDiskSessions() {
+    const out = [];
+    try {
+      const dir = process.env.DSH_HOME || path.join(homedir(), '.dsh');
+      const 会话目录 = path.join(dir, 'storages', 'session_projcache', 'sessions');
+      for (const 名 of fs.readdirSync(会话目录)) {
+        if (!String(名).endsWith('.json')) continue;
+        const id = String(名).slice(0, -5);
+        try {
+          const 记 = JSON.parse(fs.readFileSync(path.join(会话目录, 名), 'utf8'));
+          const rows = (记 && 记.record && 记.record.rows) || {};
+          if (rows.subagent && rows.subagent.val && rows.subagent.val.identity) continue;
+          out.push(id);
+        } catch {}
+      }
+    } catch {}
+    return out;
+  }
+  // 会话清单：设置页「主动回复目标会话」勾选列表
+  function listProactiveSessions() {
+    const ids = new Set();
+    const seen = new Set();
+    const 收 = (v) => {
+      const id = String(v == null ? '' : v).trim();
+      if (!id) return;
+      const key = sessionKey(id);
+      if (seen.has(key)) return;
+      seen.add(key);
+      ids.add(id);
+    };
+    // ① 活着的会话：list() 是函数（老版）或快照对象（新版）
+    try {
+      const ss = ctx.get('sessions');
+      let 活们 = [];
+      if (ss) {
+        if (typeof ss.list === 'function') 活们 = ss.list() || [];
+        else if (ss.list && typeof ss.list.getSnapshot === 'function') {
+          const 快 = ss.list.getSnapshot() || {};
+          活们 = Array.isArray(快.items) ? 快.items : (快.byId ? Object.values(快.byId) : []);
+        }
+        if (!活们.length && typeof ss.getSnapshot === 'function') {
+          const 快 = ss.getSnapshot() || {};
+          活们 = Array.isArray(快.items) ? 快.items : (快.byId ? Object.values(快.byId) : []);
+        }
+      }
+      for (const s of 活们) 收(s && (s.id || s.sessionId));
+    } catch {}
+    // ② 盘上的（关掉标签页也还在）
+    for (const id of scanDiskSessions()) 收(id);
+    // ③ 兜底：活着的 agent
+    try {
+      if (ctx.agents && typeof ctx.agents.list === 'function') {
+        for (const a of ctx.agents.list() || []) 收(a && (a.id || (a.session && a.session.id)));
+      }
+    } catch {}
+
+    const 勾着 = new Set((config.proactiveTargetSessions || []).map(sessionKey));
+    const 归档 = new Set();
+    try {
+      const reg = ctx.workspaceRegistry || ctx.get('workspaceRegistry');
+      for (const x of (reg && reg.archivedSessionIds) || []) 归档.add(sessionKey(x));
+    } catch {}
+    const out = [];
+    for (const id of ids) {
+      const 是归档 = 归档.has(sessionKey(id));
+      const 已勾 = 勾着.has(sessionKey(id));
+      if (是归档 && !已勾) continue; // 没勾的归档会话不列
+      const agent = findAgent(id);
+      out.push({
+        id,
+        title: sessionTitleOf(id),
+        status: agent === undefined ? '没活着' : agent.status === undefined ? '?' : String(agent.status),
+        alive: agent !== undefined,
+        checked: 已勾,
+        archived: 是归档,
+      });
+    }
+    return out.sort((a, b) => {
+      if (a.title !== b.title) {
+        if (a.title === '') return 1;
+        if (b.title === '') return -1;
+        return a.title.localeCompare(b.title, 'zh');
+      }
+      return a.id.localeCompare(b.id);
+    });
+  }
+  function eventText(event, role) {
+    try {
+      let blocks;
+      if (role === 'user') blocks = event && event.data && event.data.content;
+      else if (role === 'assistant') blocks = event && event.data && event.data.message && event.data.message.content;
+      if (!Array.isArray(blocks)) return '';
+      return blocks.filter(b => b && b.type === 'text' && typeof b.text === 'string').map(b => b.text).join('\n').trim();
+    } catch { return ''; }
+  }
+  function wrapThought(text) {
+    const t = String(text || '').trim();
+    return '（下面这句是你自己心里冒出来的念头，不是对方说的话；顺着它去做就行，别把它当成对方发来的消息、也不用回应它。）\n' + t;
+  }
+  function craftUserMessage(text) {
+    return { id: randomUUID(), role: 'user', content: [{ type: 'text', text: String(text) }], source: { kind: 源标记 } };
+  }
+  function computeIntervalMs(score) {
+    const s = typeof score === 'number' && Number.isFinite(score) ? Math.max(0, Math.min(1, score)) : 0;
+    const factor = 1 - 0.7 * s; // score 0 → 1.0 倍，score 1 → 0.3 倍
+    return Math.max(60000, Math.round(config.proactiveIntervalMin * 60000 * factor));
+  }
+  function rescheduleProactive() {
+    if (!config.proactiveEnabled) { proactiveState.nextProactiveAt = null; persistProactive(); return; }
+    const score = proactiveState.lastEval ? proactiveState.lastEval.score : 0;
+    proactiveState.nextProactiveAt = Date.now() + computeIntervalMs(score);
+    persistProactive();
+  }
+
+  // 最近消息缓冲（sid → {role,text,time}[]）
+  const recentMsgs = new Map();
+  const pendingEval = new Set();
+  const backfilled = new Set();
+  let proactiveBusy = false;
+
+  function pushMsg(sid, role, text) {
+    const t = String(text || '').trim();
+    if (!t) return;
+    let arr = recentMsgs.get(sid);
+    if (!arr) { arr = []; recentMsgs.set(sid, arr); }
+    arr.push({ role, text: t.slice(0, 600), time: Date.now() });
+    if (arr.length > 24) arr.splice(0, arr.length - 24);
+  }
+  async function backfill(sid) {
+    if (backfilled.has(sid)) return;
+    backfilled.add(sid);
+    try {
+      const ctrl = ctx.get('sessionController');
+      if (!ctrl || typeof ctrl.inspect !== 'function') return;
+      const report = await ctrl.inspect(sid);
+      const events = Array.isArray(report && report.events) ? report.events : [];
+      const msgs = [];
+      for (const e of events) {
+        if (!e || typeof e.type !== 'string') continue;
+        if (e.type === 'user/message') {
+          const src = e.data && e.data.source;
+          if (src && src.kind === 源标记) continue;
+          const t = eventText(e, 'user');
+          if (t) msgs.push({ role: 'user', text: t.slice(0, 600), time: e.time });
+        } else if (e.type === 'assistant/message') {
+          const t = eventText(e, 'assistant');
+          if (t) msgs.push({ role: 'assistant', text: t.slice(0, 600), time: e.time });
+        }
+      }
+      recentMsgs.set(sid, msgs.slice(-24));
+    } catch {}
+  }
+
+  // LLM 评估完毕性 / 紧急性（一次输出两个分）
+  async function evaluateConversation(sid) {
+    const msgs = recentMsgs.get(sid) || [];
+    if (!msgs.length) return null;
+    const transcript = msgs.map(m => `${m.role === 'user' ? '对方' : '机器人'}: ${m.text}`).join('\n');
+    const selection = ctx.agentDefaultModel.currentSelection();
+    const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(60000)]);
+    const call = await ctx.llm.prepareCall({ provider: selection.provider, model: selection.model, maxTokens: 400 }, signal);
+    const system = `你是对话状态评估器。看一段 QQ 群/私聊的最近对话，评估两个 0~1 的小数，严格只输出 JSON：{"completeness": <0~1>, "urgency": <0~1>}
+- completeness（完毕性）：对方是否已把话说完、这个话题是否已收尾。已收尾、没有悬而未决的问题 → 0.7 以上；话说到一半、明显还要继续 → 0.3 以下。
+- urgency（紧急性）：现在是否需要尽快主动回应。对方抛出问题/期待回应/情绪需要接住 → 0.7 以上；只是闲聊收尾、无需回应 → 0.3 以下。
+只输出 JSON，不要任何其他文字。`;
+    let text = '';
+    let finish;
+    for await (const chunk of call.stream({ ...call.config, system, messages: [{ role: 'user', content: [{ type: 'text', text: JSON.stringify({ transcript }) }] }], signal })) {
+      signal.throwIfAborted();
+      if (chunk.type === 'text-delta') text += chunk.text;
+      if (text.length > 4000) throw new Error('评估输出超出限制。');
+      if (chunk.type === 'finish') finish = chunk.reason;
+    }
+    signal.throwIfAborted();
+    if (!finish || finish.kind !== 'stop') throw new Error(`评估未完整结束：${finish && finish.kind ? finish.kind : '无结束标记'}`);
+    const cleaned = text.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+    const m = cleaned.match(/\{[\s\S]*\}/);
+    let parsed = null;
+    if (m) { try { parsed = JSON.parse(m[0]); } catch {} }
+    if (!parsed || typeof parsed !== 'object') throw new Error('模型未返回有效 JSON，跳过。');
+    let completeness = Number(parsed.completeness);
+    let urgency = Number(parsed.urgency);
+    if (!Number.isFinite(completeness)) completeness = 0;
+    if (!Number.isFinite(urgency)) urgency = 0;
+    completeness = Math.max(0, Math.min(1, completeness));
+    urgency = Math.max(0, Math.min(1, urgency));
+    const score = Math.max(0, Math.min(1, (completeness + urgency) / 2));
+    return { completeness, urgency, score, at: Date.now() };
+  }
+
+  // 到点后真正执行一次「主动回复」尝试（骰子 + followup）
+  async function proactiveAttempt() {
+    if (!config.proactiveEnabled) return;
+    const targets = config.proactiveTargetSessions || [];
+    if (!targets.length) return;
+    const arch = archivedIds();
+    const available = [];
+    const skipped = [];
+    for (const id of targets) {
+      if (arch.has(String(id))) { skipped.push(`${id}(已归档)`); continue; }
+      const a = findAgent(id);
+      if (a === undefined) { skipped.push(`${id}(没活着)`); continue; }
+      if (a.status !== undefined && a.status !== 'idle') { skipped.push(`${id}(忙)`); continue; }
+      available.push({ id, agent: a });
+    }
+    if (!available.length) {
+      if (skipped.length) logProactive(`目标会话都不可用（${skipped.join('、')}），本轮跳过`);
+      return;
+    }
+    const pick = available[Math.floor(Math.random() * available.length)];
+    const roll = Math.random() * 100;
+    if (roll > config.proactiveChance) {
+      logProactive(`没掷中 ✗ 掷出 ${roll.toFixed(1)}（命中线 ${config.proactiveChance}），本轮不回复`);
+      return;
+    }
+    const base = '对方刚说的话告一段落，你现在想主动接一句。基于刚才的对话自然回应，别突兀、别重复、别没话找话。';
+    const thought = wrapThought(base + (config.proactivePrompt ? `\n${config.proactivePrompt}` : ''));
+    if (config.proactiveDryRun) {
+      logProactive(`掷中 ✓ 掷出 ${roll.toFixed(1)}，试运行：本要往「${pick.id}」送一句「${thought.replace(/\n/g, ' ')}」`);
+      return;
+    }
+    try {
+      await pick.agent.followup(craftUserMessage(thought));
+      proactiveState.lastProactiveAt = Date.now();
+      persistProactive();
+      logProactive(`已主动回复（${pick.id}），DSH 会照常开一轮`);
+    } catch (e) {
+      proactiveState.lastError = String((e && e.message) || e).slice(0, 200);
+      persistProactive();
+      logProactive(`followup 失败：${proactiveState.lastError}`);
+    }
+  }
+
+  // 会话事件监听：抓消息 + 在 turn/end 时评估一次（直到下次对方回复）
+  ctx.effect(() => {
+    const off = ctx.on('session/event', (session, event) => {
+      try {
+        const sid = String(session && session.id ? session.id : '');
+        if (!sid) return;
+        if (!event || typeof event.type !== 'string') return;
+        if (event.type === 'user/message') {
+          const src = event.data && event.data.source;
+          const isSelf = src && src.kind === 源标记;
+          if (!isSelf) {
+            const t = eventText(event, 'user');
+            if (t) pushMsg(sid, 'user', t);
+            pendingEval.add(sid);
+          }
+        } else if (event.type === 'assistant/message') {
+          const t = eventText(event, 'assistant');
+          if (t) pushMsg(sid, 'assistant', t);
+        } else if (event.type === 'turn/end') {
+          if (!pendingEval.has(sid)) return;
+          pendingEval.delete(sid);
+          if (!config.proactiveEnabled) return;
+          if (!isTarget(sid)) return;
+          void (async () => {
+            try {
+              await backfill(sid);
+              const evalResult = await evaluateConversation(sid);
+              if (!evalResult) return;
+              proactiveState.lastEval = evalResult;
+              proactiveState.lastError = null;
+              // 评估后立即按新分重排下次尝试时间（仅缩短，不拉长）
+              proactiveState.nextProactiveAt = Date.now() + computeIntervalMs(evalResult.score);
+              persistProactive();
+              logProactive(`评估：完毕性 ${evalResult.completeness.toFixed(2)} / 紧急性 ${evalResult.urgency.toFixed(2)} → 综合 ${evalResult.score.toFixed(2)}，间隔调整为 ${Math.round(computeIntervalMs(evalResult.score) / 60000)} 分钟`);
+            } catch (e) {
+              proactiveState.lastError = String((e && e.message) || e).slice(0, 200);
+              persistProactive();
+              logProactive(`评估失败：${proactiveState.lastError}`);
+            }
+          })();
+        }
+      } catch {}
+    });
+    return () => { try { if (typeof off === 'function') off(); } catch {} };
+  }, 'proactive-reply: 会话事件监听');
+
+  // 主动回复定时器：到点尝试一次
+  const proactiveInterval = setInterval(() => {
+    if (disposed || proactiveBusy) return;
+    if (!config.proactiveEnabled) return;
+    if (!Number.isFinite(proactiveState.nextProactiveAt)) return;
+    if (Date.now() < proactiveState.nextProactiveAt) return;
+    // 先推进下次尝试时间，避免失败后卡死
+    proactiveState.nextProactiveAt = Date.now() + computeIntervalMs(proactiveState.lastEval ? proactiveState.lastEval.score : 0);
+    persistProactive();
+    proactiveBusy = true;
+    void proactiveAttempt()
+      .catch((e) => { proactiveState.lastError = String((e && e.message) || e).slice(0, 200); persistProactive(); logProactive(`这一轮出错：${proactiveState.lastError}`); })
+      .finally(() => { proactiveBusy = false; });
+  }, 15000);
+  proactiveInterval && proactiveInterval.unref();
+
+  // 启动时：若已启用，则排一次下次尝试时间
+  rescheduleProactive();
+
+  ctx.effect(() => async () => { disposed = true; abort.abort(); clearInterval(interval); clearInterval(proactiveInterval); await active; });
 }

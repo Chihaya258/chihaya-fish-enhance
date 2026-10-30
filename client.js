@@ -1,5 +1,5 @@
 window.__ModuleLoader__.load({
-  id: '@local/qzone-diary',
+  id: 'chihaya-fish-enhance',
   factory(require) {
     const React = require('react');
     const h = React.createElement;
@@ -100,6 +100,20 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
       const [tone, setTone] = React.useState('');
       const [busy, setBusy] = React.useState('');
       const [activeFeature, setActiveFeature] = React.useState('qzone');
+      const [proactiveSessions, setProactiveSessions] = React.useState([]);
+
+      React.useEffect(() => {
+        let alive = true;
+        const loadSessions = async () => {
+          try {
+            const r = await jget('/proactive-sessions');
+            if (alive && r?.ok) setProactiveSessions(r.sessions || []);
+          } catch { /* 拿不到清单就算了 */ }
+        };
+        loadSessions();
+        const t = setInterval(loadSessions, 15000);
+        return () => { alive = false; clearInterval(t); };
+      }, []);
 
       const say = (t, tn) => { setMsg(t); setTone(tn || ''); };
 
@@ -166,18 +180,86 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
         h('style', null, CSS),
         h('nav', { 'data-qzd-nav': '', 'aria-label': '机器人功能' },
           h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'qzone' ? '' : undefined, onClick: () => setActiveFeature('qzone') }, 'QQ 空间'),
+          h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'proactive' ? '' : undefined, onClick: () => setActiveFeature('proactive') }, '主动回复'),
           h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'overview' ? '' : undefined, onClick: () => setActiveFeature('overview') }, '功能总览'),
         ),
         activeFeature === 'overview' ? h('div', { 'data-qzd-feature': '' },
           h('div', { 'data-qzd-card': '' },
             h('div', { 'data-qzd-card-title': '' }, 'QQ 机器人加强插件'),
-            h('div', { 'data-qzd-note': '' }, '这里将集中管理机器人的扩展功能。当前已接入 QQ 空间，后续可继续添加消息、群管理、定时任务等功能。'),
+            h('div', { 'data-qzd-note': '' }, '这里将集中管理机器人的扩展功能。当前已接入 QQ 空间与主动回复，后续可继续添加消息、群管理、定时任务等功能。'),
           ),
           h('div', { 'data-qzd-card': '' },
             h('div', { 'data-qzd-card-title': '' }, '当前功能'),
             h('div', { 'data-qzd-label': '' }, 'QQ 空间随笔'),
             h('div', { 'data-qzd-note': '' }, '从机器人近期发言整理随笔草稿，并按计划和概率发布。'),
+            h('div', { 'data-qzd-label': '' }, '主动回复'),
+            h('div', { 'data-qzd-note': '' }, '到点主动搭话，并用大模型评估对话完毕性与紧急性来动态缩短回复间隔。'),
           ),
+        ) : null,
+        activeFeature === 'proactive' ? h('div', { 'data-qzd-feature': '' },
+          h('div', { 'data-qzd-row': '' },
+            h('span', { 'data-qzd-badge': '' }, st.proactive?.enabled ? '主动回复已开' : '主动回复关'),
+            st.proactive?.lastEval ? h('span', { 'data-qzd-badge': '' }, `最近评估：完毕 ${Math.round((st.proactive.lastEval.completeness ?? 0) * 100)}% / 紧急 ${Math.round((st.proactive.lastEval.urgency ?? 0) * 100)}%`) : null),
+          st.proactive?.nextProactiveAt ? h('div', { 'data-qzd-note': '' }, `下次主动回复尝试：${new Date(st.proactive.nextProactiveAt).toLocaleString('zh-CN', { hour12: false })}`) : null,
+
+          h('div', { 'data-qzd-sec': '' },
+            h('div', { 'data-qzd-h': '' }, '开关'),
+            h(ToggleRow, {
+              label: '允许主动回复',
+              note: '关着 = 完全不主动搭话（默认）。',
+              on: Boolean(cfg.proactiveEnabled),
+              onChange: (v) => patch({ proactiveEnabled: v }, '主动回复'),
+            }),
+            h(ToggleRow, {
+              label: '试运行',
+              note: '开着 = 掷中也只记账、不真发（默认），先看几轮再关。',
+              on: Boolean(cfg.proactiveDryRun),
+              onChange: (v) => patch({ proactiveDryRun: v }, '试运行'),
+            })),
+
+          h('div', { 'data-qzd-sec': '' },
+            h('div', { 'data-qzd-h': '' }, '目标会话'),
+            h('div', { 'data-qzd-note': '' }, '勾选后，到点会在其中一个「活着且空闲」的会话里主动开一轮。'),
+            proactiveSessions.length === 0 ? h('div', { 'data-qzd-note': '' }, '（拿不到会话清单，可在配置里直接填会话 ID）') : null,
+            ...proactiveSessions.map((s) => {
+              const checked = (cfg.proactiveTargetSessions || []).some((id) => id === s.id);
+              const toggle = (on) => {
+                const cur = new Set(cfg.proactiveTargetSessions || []);
+                if (on) cur.add(s.id); else cur.delete(s.id);
+                patch({ proactiveTargetSessions: [...cur] }, '目标会话');
+              };
+              return h('div', { 'data-qzd-row': '', key: s.id },
+                h('div', { 'data-qzd-grow': '' },
+                  h('div', { 'data-qzd-label': '' }, s.title || s.id),
+                  h('div', { 'data-qzd-note': '' }, `${s.status ?? 'idle'} · ${s.id}`)),
+                h(Switch, { on: checked, onChange: toggle }));
+            })),
+
+          h('div', { 'data-qzd-sec': '' },
+            h('div', { 'data-qzd-h': '' }, '节奏'),
+            h(NumRow, {
+              label: '基础间隔（分钟）', value: cfg.proactiveIntervalMin, min: 1, max: 1440,
+              note: '每隔这么久尝试一次；评估分越高，实际间隔越短（最低缩到 30%）。',
+              onCommit: (v) => patch({ proactiveIntervalMin: Number(v) }, '基础间隔'),
+            }),
+            h(NumRow, {
+              label: '掷骰命中线（0~100）', value: cfg.proactiveChance, min: 0, max: 100,
+              note: '到点掷 0~100，≤ 此值才真正回复。',
+              onCommit: (v) => patch({ proactiveChance: Number(v) }, '命中线'),
+            })),
+
+          h('div', { 'data-qzd-sec': '' },
+            h('div', { 'data-qzd-h': '' }, '回复风格'),
+            h('div', { 'data-qzd-note': '' }, '可选补充，加到主动回复的触发语境里。'),
+            h('textarea', {
+              'data-qzd-input': '', rows: 3, value: cfg.proactivePrompt || '',
+              placeholder: '例如：语气轻松一点，别追问太多。',
+              onChange: (e) => patch({ proactivePrompt: e.target.value }, '回复风格'),
+            })),
+
+          (st.proactive?.log && st.proactive.log.length) ? h('div', { 'data-qzd-sec': '' },
+            h('div', { 'data-qzd-h': '' }, '最近记录'),
+            ...st.proactive.log.slice().reverse().map((l, i) => h('div', { 'data-qzd-pre': '', key: i }, `${new Date(l.at).toLocaleString('zh-CN', { hour12: false })}　${l.text}`))) : null,
         ) : null,
         activeFeature !== 'qzone' ? null : h(React.Fragment, null,
         h('div', { 'data-qzd-row': '' },

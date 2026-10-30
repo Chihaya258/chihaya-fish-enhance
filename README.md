@@ -30,7 +30,7 @@ qzone-diary/
 ├── client.js           # 客户端：机器人加强插件设置页（功能总览 + QQ 空间子菜单）
 ├── cordis.patch.yml    # bundle 补丁：注册插件并写入默认配置
 ├── icon.svg            # 插件图标
-├── package.json        # 包元信息（name: @local/qzone-diary）
+├── package.json        # 包元信息（name: chihaya-fish-enhance）
 └── locale/
     ├── zh.json         # 中文元信息
     └── en.json         # 英文元信息
@@ -105,16 +105,16 @@ Authorization: Bearer {accessToken}
 # 1. 放入插件目录
 cp -r qzone-diary /root/.dsh/plugins/qzone-diary
 
-# 2. 注册进 web profile（bundle 里写包名 @local/qzone-diary）
+# 2. 注册进 web profile（bundle 里写包名 chihaya-fish-enhance）
 cd /root/.dsh/profiles/web
 node -e "
 const fs=require('fs');
 const p=JSON.parse(fs.readFileSync('package.json','utf8'));
-p.dependencies['@local/qzone-diary']='link:/root/.dsh/plugins/qzone-diary';
-p.dsh.profile.bundles.push('@local/qzone-diary');
+p.dependencies['chihaya-fish-enhance']='link:/root/.dsh/plugins/qzone-diary';
+p.dsh.profile.bundles.push('chihaya-fish-enhance');
 fs.writeFileSync('package.json', JSON.stringify(p,null,2)+'\n');
 "
-ln -sfn /root/.dsh/plugins/qzone-diary node_modules/@local/qzone-diary
+ln -sfn /root/.dsh/plugins/qzone-diary node_modules/chihaya-fish-enhance
 
 # 3. 重启
 systemctl restart dsh-web
@@ -130,4 +130,4 @@ systemctl restart dsh-web
 ## 版本
 
 - 当前 `package.json` 版本：`1.1.0`
-- 包名：`@local/qzone-diary`（`private: true`）
+- 包名：`chihaya-fish-enhance`（`private: true`）

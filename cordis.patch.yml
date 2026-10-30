@@ -1,6 +1,6 @@
 - insert:
     - id: qzone-diary
-      name: '@local/qzone-diary'
+      name: 'chihaya-fish-enhance'
       config:
         bridgeRoot: /opt/qq-bridge
         publishEnabled: false
@@ -12,3 +12,9 @@
         sourceKeys: []
         adminSessionIds: []
         prompt: ''
+        proactiveEnabled: false
+        proactiveTargetSessions: []
+        proactiveIntervalMin: 30
+        proactiveChance: 50
+        proactiveDryRun: true
+        proactivePrompt: ''
