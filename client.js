@@ -293,6 +293,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
         h('nav', { 'data-qzd-nav': '', 'aria-label': '机器人功能' },
           h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'qzone' ? '' : undefined, onClick: () => setActiveFeature('qzone') }, 'QQ 空间'),
           h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'proactive' ? '' : undefined, onClick: () => setActiveFeature('proactive') }, '主动回复'),
+          h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'voice' ? '' : undefined, onClick: () => setActiveFeature('voice') }, '语音合成'),
           h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'overview' ? '' : undefined, onClick: () => setActiveFeature('overview') }, '功能总览'),
         ),
         activeFeature === 'overview' ? h('div', { 'data-qzd-feature': '' },
@@ -306,6 +307,8 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
             h('div', { 'data-qzd-note': '' }, '从机器人近期发言整理随笔草稿，并按计划和概率发布。'),
             h('div', { 'data-qzd-label': '' }, '主动回复'),
             h('div', { 'data-qzd-note': '' }, '到点主动搭话，并用大模型给「现在该不该开口」打个分，据此动态调整间隔与命中线。'),
+            h('div', { 'data-qzd-label': '' }, '语音合成'),
+            h('div', { 'data-qzd-note': '' }, '按几率把回复转成语音：用一段话描述想要的音色，交给 TTS 模型现合成一条，放进语音库再发出去。'),
           ),
         ) : null,
         activeFeature === 'proactive' ? h('div', { 'data-qzd-feature': '' },
@@ -532,6 +535,90 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
 
           (st.proactive?.log && st.proactive.log.length) ? h(Card, { title: '最近记录' },
             ...st.proactive.log.slice().reverse().map((l, i) => h('div', { 'data-qzd-pre': '', key: i }, `${new Date(l.at).toLocaleString('zh-CN', { hour12: false })}　${l.text}`))) : null,
+        ) : null,
+        activeFeature === 'voice' ? h('div', { 'data-qzd-feature': '' },
+          h('div', { 'data-qzd-row': '' },
+            h('span', { 'data-qzd-badge': '' }, cfg.ttsEnabled ? '语音合成已开' : '语音合成关'),
+            h('span', { 'data-qzd-badge': '' }, `触发率 ${cfg.ttsChance ?? 20}%`),
+            h('span', { 'data-qzd-badge': '' }, st.tts?.hasKey ? '密钥已填' : '缺密钥')),
+
+          h(Card, { title: '开关与几率' },
+            h(Para, null, '开着之后，每条主动回复都有一定概率不走文字、改发一段语音。'),
+            h(ToggleRow, {
+              label: '启用语音合成',
+              note: '关着 = 完全不合成语音，下面填什么都不生效。',
+              on: Boolean(cfg.ttsEnabled),
+              onChange: (v) => patch({ ttsEnabled: v }, '语音合成'),
+            }),
+            h(Field, {
+              label: '发送语音的触发几率（%）',
+              hint: '每条回复掷一次骰子，掷到以下就改成发语音。默认 20，即五次里有一次左右。',
+            },
+              h(NumInput, {
+                value: cfg.ttsChance ?? 20, min: 0, max: 100,
+                onCommit: (v) => patch({ ttsChance: Number(v) }, '触发几率'),
+              }))),
+
+          h(Card, { title: '模型配置' },
+            h(Para, null, '走 OpenAI 兼容的 /chat/completions 接口。程序按「音色设计」模式调用：user 消息放音色提示词，assistant 消息放要朗读的文本。'),
+            h(Field, {
+              label: '接口地址',
+              hint: '填到 /v1 为止，程序会自动拼上 /chat/completions。',
+            },
+              h('input', {
+                'data-qzd-input': '', value: cfg.ttsApiBase ?? 'https://api.xiaomimimo.com/v1',
+                placeholder: 'https://api.xiaomimimo.com/v1',
+                onChange: (e) => patch({ ttsApiBase: e.target.value }, '接口地址'),
+              })),
+            h(Field, {
+              label: '接口密钥',
+              hint: '存在 QQ 桥接的状态目录里，不会回显到页面以外的任何地方。',
+            },
+              h('input', {
+                'data-qzd-input': '', type: 'password', value: cfg.ttsApiKey || '',
+                placeholder: 'sk-…', autoComplete: 'off',
+                onChange: (e) => patch({ ttsApiKey: e.target.value }, '接口密钥'),
+              })),
+            h(Field, {
+              label: '模型名',
+              hint: '默认 mimo-v2.5-tts-voicedesign。换别的同协议模型也可以，但音色设计语义按 voicedesign 走。',
+            },
+              h('input', {
+                'data-qzd-input': '', value: cfg.ttsModel ?? '',
+                placeholder: 'mimo-v2.5-tts-voicedesign',
+                onChange: (e) => patch({ ttsModel: e.target.value }, '模型名'),
+              })),
+            h(ToggleRow, {
+              label: '智能润色播报文本',
+              note: '开着 = 让模型自己对文本做润色（优化的是朗读效果，不是改写内容）。',
+              on: Boolean(cfg.ttsOptimizeText),
+              onChange: (v) => patch({ ttsOptimizeText: v }, '智能润色'),
+            })),
+
+          h(Card, { title: '音色提示词' },
+            h(Para, null, '用一段自然语言描述你想要的声音。写清楚这几项效果最好：性别与年龄、音色质感、情绪语气、语速节奏；可选加角色人设、说话风格、场景。1~4 句即可，别堆砌互相矛盾的特征，也别写混响/回声这类后期效果词。'),
+            h('textarea', {
+              'data-qzd-input': '', rows: 5, value: cfg.ttsVoicePrompt || '',
+              placeholder: '例如：一位年轻女生，声音清亮带点甜，语速自然偏快，说话像在跟熟人聊天，轻松随性，带一点俏皮的笑意。',
+              onChange: (e) => patch({ ttsVoicePrompt: e.target.value }, '音色提示词'),
+            }),
+            h(Hint, null, '提示词是人设，不是每句话的语气。单条想调整语气，可以在正文里用 (温柔) / (叹气) 这类标签。')),
+
+          h(Card, { title: '语音库' },
+            h(Para, null, `合成好的文件会写进 QQ 桥接的语音库目录：${st.tts?.voiceDir ?? '（未知）'}`),
+            h(Field, {
+              label: '保留最近几个文件',
+              hint: '只清理本插件生成的文件（文件名以 fish- 开头），别的东西一概不碰。',
+            },
+              h(NumInput, {
+                value: cfg.ttsKeepFiles ?? 30, min: 1, max: 200,
+                onCommit: (v) => patch({ ttsKeepFiles: Number(v) }, '保留数量'),
+              })),
+            h(Warn, null, '语音要真发出去，还得在 QQ 桥接控制台的「二代仿真 → 语音库与语音发送」里打开开关，否则只有文件、发不出去。')),
+
+          (st.tts?.log && st.tts.log.length) ? h(Card, { title: '最近记录' },
+            st.tts.lastError ? h(Warn, null, `上次错误：${st.tts.lastError}`) : null,
+            ...st.tts.log.slice().reverse().map((l, i) => h('div', { 'data-qzd-pre': '', key: i }, `${new Date(l.at).toLocaleString('zh-CN', { hour12: false })}　${l.text}`))) : null,
         ) : null,
         activeFeature !== 'qzone' ? null : h(React.Fragment, null,
         h('div', { 'data-qzd-row': '' },
