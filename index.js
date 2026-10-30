@@ -21,14 +21,17 @@ export const Config = z.object({
   proactiveEnabled: z.boolean().default(false).description('主动回复总开关'),
   proactiveTargetSessions: z.array(z.string()).default([]).description('主动回复的目标 DSH 会话 ID'),
   proactiveIntervalMin: z.number().min(1).max(1440).default(30).description('主动回复基础间隔（分钟）'),
-  proactiveEvalEnabled: z.boolean().default(true).description('每轮对话后用大模型评估完毕性/紧急性，据此缩短主动回复间隔'),
-  proactiveEvalShrink: z.number().min(0).max(100).default(70).description('评估缩短幅度（%）：综合分 1 时间隔缩到基础间隔的 (100-该值)%'),
-  proactiveEvalInfluence: z.number().min(0).max(100).default(50).description('评估影响命中线的幅度（%）：综合分 0 → 命中线 ×(1-该值%)，综合分 1 → ×(1+该值%)，综合分 0.5 不变'),
+  proactiveEvalEnabled: z.boolean().default(true).description('每轮对话后用大模型评估「现在该不该开口」，据此调整间隔与命中线'),
+  proactiveEvalShrink: z.number().min(0).max(100).default(70).description('评估缩短幅度（%）：评估分 1 时间隔缩到基础间隔的 (100-该值)%'),
+  proactiveEvalInfluence: z.number().min(0).max(100).default(50).description('评估影响命中线的幅度（%）：评估分 0 → 命中线 ×(1-该值%)，评估分 1 → ×(1+该值%)，评估分 0.5 不变'),
   proactiveChance: z.number().step(1).min(0).max(100).default(50).description('谷时命中线（0~100，掷到以下才回复）'),
   proactivePeakChance: z.number().step(1).min(0).max(100).default(20).description('峰时命中线（0~100；周一~五 9-12/14-18 点为峰时）'),
   proactivePeakTz: z.string().max(64).default('').description('峰谷判断时区（IANA 名，留空=本机时区）'),
   proactiveMissBonus: z.number().step(1).min(0).max(100).default(10).description('没掷中加成：每没中一次命中线加多少'),
   proactiveMissBonusMax: z.number().step(1).min(0).max(100).default(40).description('没中加成上限'),
+  proactiveMissFloorStreak: z.number().step(1).min(1).max(100).default(4).description('连续没中达到几次后启用保底命中线'),
+  proactiveMissFloor: z.number().step(1).min(0).max(100).default(65).description('保底命中线：连没中达标后本轮命中线不低于此值'),
+  proactiveChanceCap: z.number().step(1).min(1).max(100).default(95).description('命中线上限（防止必然开口）'),
   proactiveQuietStart: z.number().step(1).min(0).max(23).default(1).description('安静时段起（小时，含起；=止表示不启用）'),
   proactiveQuietEnd: z.number().step(1).min(0).max(23).default(8).description('安静时段止（小时，不含止）'),
   proactiveNearMin: z.number().min(1).max(1440).default(20).description('距对方上次说话小于此分钟 → 命中线乘近因子'),
@@ -713,8 +716,14 @@ export function apply(ctx, rawConfig) {
     return h >= s || h < e; // 跨午夜
   }
 
-  // ── 命中线计算：档位命中线 × 时机因子 × 评估系数 + 没中加成，夹 0~100（先乘因子再加加成）──
-  // 评估系数：综合分 0 → ×(1-influence)，0.5 → ×1，1 → ×(1+influence)，让「对话评估」真正影响这次开不开口
+  // ── 命中线计算 ──
+  // 结构：有效基础率 base → 乘时机因子、乘评估系数 → 加没中加成（保底上涨）→ 夹 [下限, 上限]
+  //   base  = 峰/谷档位命中线
+  //   factor= 距上次说话太近(<nearMin) 或太远(>farMin) 的降权
+  //   eval  = 单一评估分 0 → ×(1-influence)，0.5 → ×1，1 → ×(1+influence)
+  //   bonus = 连续没中累积，保证「该轮到」时一定抬起来
+  // 关键改进：先算「不含加成的裸命中率」，再用加成把它抬到 floor 与 cap 之间，
+  // 避免旧版「base×factor×eval 已经很小时，+bonus 依然抬不起来」的问题。
   function computeChanceLine(at, sinceUserMin) {
     const peak = isPeak(at, config.proactivePeakTz);
     const base = peak ? config.proactivePeakChance : config.proactiveChance;
@@ -723,21 +732,31 @@ export function apply(ctx, rawConfig) {
       if (sinceUserMin < config.proactiveNearMin) factor = config.proactiveNearFactor;
       else if (sinceUserMin > config.proactiveFarMin) factor = config.proactiveFarFactor;
     }
-    // 评估关闭时系数恒为 1（不影响命中线）；effectiveScore() 在关闭时本就返回 0，这里再无条件保底
     const evalScore = effectiveScore();
     const influence = Math.max(0, Math.min(100, Number(config.proactiveEvalInfluence) || 0)) / 100;
     const evalFactor = config.proactiveEvalEnabled ? 1 + (evalScore * 2 - 1) * influence : 1;
+    // 裸命中率（不含没中加成）
+    const raw = Math.max(0, Math.min(100, base * factor * evalFactor));
+    // 没中加成：每没中一次加 missBonus，最多 missBonusMax
     const bonus = Math.min(config.proactiveMissBonusMax, proactiveMissStreak * config.proactiveMissBonus);
-    const line = Math.min(100, Math.max(0, base * factor * evalFactor + bonus));
-    return { peak, base, factor, evalScore, evalFactor, bonus, line };
+    // 保底：连没中达到 missFloorStreak 次后，命中线不低于 missFloor。
+    // 但保底受「时机因子」约束 —— 对方刚说完话（factor 很小）时不该被硬抬上去，所以保底也乘上 factor。
+    const floor = proactiveMissStreak >= config.proactiveMissFloorStreak ? config.proactiveMissFloor * factor : 0;
+    // 加成同样受时机因子缩放：刚说完话时加成效果打折，避免靠攒没中硬闯打断对方
+    const scaledBonus = bonus * Math.min(1, factor);
+    // 夹在 [保底, 上限] 之间
+    const line = Math.min(config.proactiveChanceCap, Math.max(floor, Math.min(100, raw + scaledBonus)));
+    return { peak, base, factor, evalScore, evalFactor, bonus: scaledBonus, floor, raw, line };
   }
   // 把命中线算式拼成一行可读文本（写进日志）
   function chanceLineText(calc, sinceUserMin) {
     const 距离 = sinceUserMin === undefined ? '距上次说话时间不明' : `距对方上次说话 ${sinceUserMin.toFixed(1)} 分钟`;
     const evalPart = config.proactiveEvalEnabled
-      ? ` × 评估系数 ${calc.evalFactor.toFixed(2)}（综合 ${calc.evalScore.toFixed(2)}）`
+      ? ` × 评估系数 ${calc.evalFactor.toFixed(2)}（评估分 ${calc.evalScore.toFixed(2)}）`
       : '';
-    return `${calc.line.toFixed(1)} = ${calc.peak ? '峰时' : '谷时'}命中线 ${calc.base}% × 时机因子 ${calc.factor}（${距离}）${evalPart}${calc.bonus > 0 ? ` + 没中加成 ${calc.bonus.toFixed(1)}` : ''}`;
+    const bonusPart = calc.bonus > 0 ? ` + 没中加成 ${calc.bonus.toFixed(1)}（连没中 ${proactiveMissStreak} 次）` : '';
+    const floorPart = calc.floor > 0 ? `，保底抬到 ${calc.floor}` : '';
+    return `${calc.line.toFixed(1)} = ${calc.peak ? '峰时' : '谷时'}命中线 ${calc.base}% × 时机因子 ${calc.factor}（${距离}）${evalPart}${bonusPart}${floorPart}`;
   }
   function rescheduleProactive() {
     if (!config.proactiveEnabled) { proactiveState.nextProactiveAt = null; persistProactive(); return; }
@@ -784,17 +803,22 @@ export function apply(ctx, rawConfig) {
     } catch {}
   }
 
-  // LLM 评估完毕性 / 紧急性（一次输出两个分）
+  // LLM 评估对话状态 → 单一 0~1 分数（越高 = 越该现在开口）
   async function evaluateConversation(sid) {
     const msgs = recentMsgs.get(sid) || [];
     if (!msgs.length) return null;
     const transcript = msgs.map(m => `${m.role === 'user' ? '对方' : '机器人'}: ${m.text}`).join('\n');
     const selection = ctx.agentDefaultModel.currentSelection();
     const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(60000)]);
-    const call = await ctx.llm.prepareCall({ provider: selection.provider, model: selection.model, maxTokens: 400 }, signal);
-    const system = `你是对话状态评估器。看一段 QQ 群/私聊的最近对话，评估两个 0~1 的小数，严格只输出 JSON：{"completeness": <0~1>, "urgency": <0~1>}
-- completeness（完毕性）：对方是否已把话说完、这个话题是否已收尾。已收尾、没有悬而未决的问题 → 0.7 以上；话说到一半、明显还要继续 → 0.3 以下。
-- urgency（紧急性）：现在是否需要尽快主动回应。对方抛出问题/期待回应/情绪需要接住 → 0.7 以上；只是闲聊收尾、无需回应 → 0.3 以下。
+    const call = await ctx.llm.prepareCall({ provider: selection.provider, model: selection.model, maxTokens: 200 }, signal);
+    const system = `你是对话状态评估器。看一段 QQ 群/私聊的最近对话，判断「现在该不该由机器人主动开口」，输出一个 0~1 的分数，严格只输出 JSON：{"score": <0~1>, "reason": "<20字以内>"}
+评分标准（综合判断，不要拆维度机械相加）：
+- 1.0：对方抛出问题/在等回应/情绪需要接住，且话明显没说完 → 现在就该接
+- 0.7：话题还有延展空间，主动接一句自然、不突兀
+- 0.5：中性，开口也行不开口也行
+- 0.3：对方已收尾、或在跟别人聊，插进去略突兀
+- 0.0：明显已结束的寒暄、机器人插话只会打断氛围
+判断时把这些一起看：对话是否悬而未决、有没有直接问机器人、情绪浓度、距离上次发言多久、是不是一句「嗯/哦/好的」的收尾。
 只输出 JSON，不要任何其他文字。`;
     let text = '';
     let finish;
@@ -811,14 +835,11 @@ export function apply(ctx, rawConfig) {
     let parsed = null;
     if (m) { try { parsed = JSON.parse(m[0]); } catch {} }
     if (!parsed || typeof parsed !== 'object') throw new Error('模型未返回有效 JSON，跳过。');
-    let completeness = Number(parsed.completeness);
-    let urgency = Number(parsed.urgency);
-    if (!Number.isFinite(completeness)) completeness = 0;
-    if (!Number.isFinite(urgency)) urgency = 0;
-    completeness = Math.max(0, Math.min(1, completeness));
-    urgency = Math.max(0, Math.min(1, urgency));
-    const score = Math.max(0, Math.min(1, (completeness + urgency) / 2));
-    return { completeness, urgency, score, at: Date.now() };
+    let score = Number(parsed.score);
+    if (!Number.isFinite(score)) throw new Error('模型未返回有效 score，跳过。');
+    score = Math.max(0, Math.min(1, score));
+    const reason = String(parsed.reason || '').slice(0, 40);
+    return { score, reason, at: Date.now() };
   }
 
   // 到点后真正执行一次「主动回复」尝试（骰子 + followup）
@@ -949,7 +970,8 @@ export function apply(ctx, rawConfig) {
               // 评估后立即按新分重排下次尝试时间（仅缩短，不拉长）
               proactiveState.nextProactiveAt = Date.now() + computeIntervalMs(evalResult.score);
               persistProactive();
-              logProactive(`评估：完毕性 ${evalResult.completeness.toFixed(2)} / 紧急性 ${evalResult.urgency.toFixed(2)} → 综合 ${evalResult.score.toFixed(2)}，间隔调整为 ${Math.round(computeIntervalMs(evalResult.score) / 60000)} 分钟`);
+              const 系数 = config.proactiveEvalEnabled ? 1 + (evalResult.score * 2 - 1) * (Math.max(0, Math.min(100, Number(config.proactiveEvalInfluence) || 0)) / 100) : 1;
+              logProactive(`评估：${evalResult.score.toFixed(2)}${evalResult.reason ? `（${evalResult.reason}）` : ''} → 命中线系数 ×${系数.toFixed(2)}，间隔调整为 ${Math.round(computeIntervalMs(evalResult.score) / 60000)} 分钟`);
             } catch (e) {
               proactiveState.lastError = String((e && e.message) || e).slice(0, 200);
               persistProactive();
