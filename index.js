@@ -23,7 +23,7 @@ export const Config = z.object({
   proactiveIntervalMin: z.number().min(1).max(1440).default(30).description('主动回复基础间隔（分钟）'),
   proactiveEvalEnabled: z.boolean().default(true).description('每轮对话后用大模型评估「现在该不该开口」，据此调整间隔与命中线'),
   proactiveEvalShrink: z.number().min(0).max(100).default(70).description('评估缩短幅度（%）：评估分 1 时间隔缩到基础间隔的 (100-该值)%'),
-  proactiveEvalInfluence: z.number().min(0).max(100).default(50).description('评估影响命中线的幅度（%）：评估分 0 → 命中线 ×(1-该值%)，评估分 1 → ×(1+该值%)，评估分 0.5 不变'),
+  proactiveEvalInfluence: z.number().min(0).max(100).default(50).description('评估抬升命中线的幅度（%）：以 0 分为基线，评估分 0 → ×1（不改变），评估分 1 → ×(1+该值%)'),
   proactiveChance: z.number().step(1).min(0).max(100).default(50).description('谷时命中线（0~100，掷到以下才回复）'),
   proactivePeakChance: z.number().step(1).min(0).max(100).default(20).description('峰时命中线（0~100；周一~五 9-12/14-18 点为峰时）'),
   proactivePeakTz: z.string().max(64).default('').description('峰谷判断时区（IANA 名，留空=本机时区）'),
@@ -176,7 +176,7 @@ export function apply(ctx, rawConfig) {
       evalEnabled: config.proactiveEvalEnabled,
       evalShrink: config.proactiveEvalShrink,
       evalInfluence: config.proactiveEvalInfluence,
-      evalFactor: config.proactiveEvalEnabled ? 1 + (effectiveScore() * 2 - 1) * (Math.max(0, Math.min(100, Number(config.proactiveEvalInfluence) || 0)) / 100) : 1,
+      evalFactor: config.proactiveEvalEnabled ? 1 + effectiveScore() * (Math.max(0, Math.min(100, Number(config.proactiveEvalInfluence) || 0)) / 100) : 1,
       effectiveIntervalMin: Math.round(computeIntervalMs(effectiveScore()) / 60000),
       chance: config.proactiveChance,
       peakChance: config.proactivePeakChance,
@@ -720,7 +720,7 @@ export function apply(ctx, rawConfig) {
   // 结构：有效基础率 base → 乘时机因子、乘评估系数 → 加没中加成（保底上涨）→ 夹 [下限, 上限]
   //   base  = 峰/谷档位命中线
   //   factor= 距上次说话太近(<nearMin) 或太远(>farMin) 的降权
-  //   eval  = 单一评估分 0 → ×(1-influence)，0.5 → ×1，1 → ×(1+influence)
+  //   eval  = 单一评估分，以 0 为基线：0 → ×1（不改变），1 → ×(1+influence)，中间线性
   //   bonus = 连续没中累积，保证「该轮到」时一定抬起来
   // 关键改进：先算「不含加成的裸命中率」，再用加成把它抬到 floor 与 cap 之间，
   // 避免旧版「base×factor×eval 已经很小时，+bonus 依然抬不起来」的问题。
@@ -734,7 +734,8 @@ export function apply(ctx, rawConfig) {
     }
     const evalScore = effectiveScore();
     const influence = Math.max(0, Math.min(100, Number(config.proactiveEvalInfluence) || 0)) / 100;
-    const evalFactor = config.proactiveEvalEnabled ? 1 + (evalScore * 2 - 1) * influence : 1;
+    // 以 0 分为基线：分数 0 → 系数 1.00（完全不改变命中线），分数越高越往上抬，分数 1 → ×(1 + influence)
+    const evalFactor = config.proactiveEvalEnabled ? 1 + evalScore * influence : 1;
     // 裸命中率（不含没中加成）
     const raw = Math.max(0, Math.min(100, base * factor * evalFactor));
     // 没中加成：每没中一次加 missBonus，最多 missBonusMax

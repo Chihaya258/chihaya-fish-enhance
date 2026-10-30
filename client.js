@@ -425,8 +425,8 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
                 onCommit: (v) => patch({ proactiveEvalShrink: Number(v) }, '缩短幅度'),
               })),
             h(Field, {
-              label: '评估影响命中线幅度（%）',
-              hint: '以 0.5 分为中心对称缩放：0.5 分 → ×1.00 不变；0 分 → ×(1 − 幅度%)；1 分 → ×(1 + 幅度%)。默认 50，即 0 分压到一半、1 分抬到一倍半。把这格填 0 → 评估只影响间隔，完全不动命中线。',
+              label: '评估抬升命中线幅度（%）',
+              hint: '以 0 分为基线向上抬：0 分 → ×1.00（完全不改变命中线）；分数越高抬得越多，1 分 → ×(1 + 幅度%)。默认 50，即 1 分抬到 1.5 倍。把这格填 0 → 评估只影响间隔，完全不动命中线。',
             },
               h(NumInput, {
                 value: cfg.proactiveEvalInfluence ?? 50, min: 0, max: 100,
