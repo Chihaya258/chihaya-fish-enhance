@@ -1163,7 +1163,9 @@ export function apply(ctx, rawConfig) {
               // 评估后立即按新分重排下次尝试时间（仅缩短，不拉长）
               proactiveState.nextProactiveAt = Date.now() + computeIntervalMs(evalResult.score);
               persistProactive();
-              const 系数 = config.proactiveEvalEnabled ? 1 + (evalResult.score * 2 - 1) * (Math.max(0, Math.min(100, Number(config.proactiveEvalInfluence) || 0)) / 100) : 1;
+              // 与 computeChanceLine 里的 evalFactor 必须是同一套公式（以 0 分为基线）
+              const 幅度 = Math.max(0, Math.min(100, Number(config.proactiveEvalInfluence) || 0)) / 100;
+              const 系数 = config.proactiveEvalEnabled ? 1 + evalResult.score * 幅度 : 1;
               logProactive(`评估：${evalResult.score.toFixed(2)}${evalResult.reason ? `（${evalResult.reason}）` : ''} → 命中线系数 ×${系数.toFixed(2)}，间隔调整为 ${Math.round(computeIntervalMs(evalResult.score) / 60000)} 分钟`);
             } catch (e) {
               proactiveState.lastError = String((e && e.message) || e).slice(0, 200);
