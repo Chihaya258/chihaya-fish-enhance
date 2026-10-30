@@ -42,15 +42,6 @@ export const Config = z.object({
   proactiveTriggerText: z.string().max(500).default('对方刚说的话告一段落，你现在想主动接一句。基于刚才的对话自然回应，别突兀、别重复、别没话找话。').description('触发文案（将作为「你自己的念头」送进会话）'),
   proactivePrompt: z.string().max(2000).default('').description('主动回复风格补充（追加在触发文案后）'),
   proactiveDryRun: z.boolean().default(true).description('主动回复试运行：只记账不真发'),
-  // —— 语音合成（MiMo TTS，voicedesign 音色设计模式）——
-  ttsEnabled: z.boolean().default(false).description('语音合成总开关：开着才会把回复转成语音发出去'),
-  ttsChance: z.number().step(1).min(0).max(100).default(20).description('发送语音的触发几率（%）：每条回复有这么大的概率改发语音'),
-  ttsApiBase: z.string().max(300).default('https://api.xiaomimimo.com/v1').description('TTS 接口地址（OpenAI 兼容，填到 /v1 为止）'),
-  ttsApiKey: z.string().max(300).default('').description('TTS 接口密钥（Api Key）'),
-  ttsModel: z.string().max(120).default('mimo-v2.5-tts-voicedesign').description('TTS 模型名（可自定义；程序按音色设计模式调用）'),
-  ttsVoicePrompt: z.string().max(2000).default('一位年轻女生，声音清亮带点甜，语速自然偏快，说话像在跟熟人聊天，轻松随性，带一点俏皮的笑意。').description('音色提示词：用一段话描述想要的音色（性别/年龄/音色质感/情绪/语速/人设/场景）'),
-  ttsOptimizeText: z.boolean().default(false).description('是否让模型智能润色播报文本（voicedesign 的 optimize_text_preview）'),
-  ttsKeepFiles: z.number().step(1).min(1).max(200).default(30).description('语音库保留最近多少个合成文件（超出自动清理）'),
 });
 
 export function dayKey(time) {
@@ -116,7 +107,7 @@ export function apply(ctx, rawConfig) {
   fs.accessSync(path.dirname(statePath), fs.constants.W_OK);
 
   // ── 配置：cordis 默认 → 磁盘 JSON（旧字段映射）──
-  const HOT_KEYS = ['publishEnabled', 'intervalHours', 'randomJitterMinutes', 'maxPerDay', 'maxChars', 'visibility', 'sourceKeys', 'adminSessionIds', 'prompt', 'proactiveEnabled', 'proactiveTargetSessions', 'proactiveIntervalMin', 'proactiveEvalEnabled', 'proactiveEvalShrink', 'proactiveChance', 'proactivePeakChance', 'proactivePeakTz', 'proactiveMissBonus', 'proactiveMissBonusMax', 'proactiveQuietStart', 'proactiveQuietEnd', 'proactiveNearMin', 'proactiveNearFactor', 'proactiveFarMin', 'proactiveFarFactor', 'proactiveCooldownMin', 'proactiveTriggerText', 'proactivePrompt', 'proactiveDryRun', 'proactiveEvalInfluence', 'proactiveMissFloorStreak', 'proactiveMissFloor', 'proactiveChanceCap', 'ttsEnabled', 'ttsChance', 'ttsApiBase', 'ttsApiKey', 'ttsModel', 'ttsVoicePrompt', 'ttsOptimizeText', 'ttsKeepFiles'];
+  const HOT_KEYS = ['publishEnabled', 'intervalHours', 'randomJitterMinutes', 'maxPerDay', 'maxChars', 'visibility', 'sourceKeys', 'adminSessionIds', 'prompt', 'proactiveEnabled', 'proactiveTargetSessions', 'proactiveIntervalMin', 'proactiveEvalEnabled', 'proactiveEvalShrink', 'proactiveChance', 'proactivePeakChance', 'proactivePeakTz', 'proactiveMissBonus', 'proactiveMissBonusMax', 'proactiveQuietStart', 'proactiveQuietEnd', 'proactiveNearMin', 'proactiveNearFactor', 'proactiveFarMin', 'proactiveFarFactor', 'proactiveCooldownMin', 'proactiveTriggerText', 'proactivePrompt', 'proactiveDryRun', 'proactiveEvalInfluence', 'proactiveMissFloorStreak', 'proactiveMissFloor', 'proactiveChanceCap'];
   const persisted = load(configPath, {});
   const config = {
     bridgeRoot: cordisConfig.bridgeRoot,
@@ -144,13 +135,6 @@ export function apply(ctx, rawConfig) {
     persistProactive();
     try { ctx.logger.info(`proactive-reply: ${String(text)}`); } catch {}
   };
-
-  // ── 语音合成状态 ──
-  const ttsStatePath = path.join(cordisConfig.bridgeRoot, 'state/qzone-tts.json');
-  const ttsInitial = { log: [], lastError: null };
-  const ttsState = load(ttsStatePath, ttsInitial);
-  if (!Array.isArray(ttsState.log)) ttsState.log = [];
-  const persistTts = () => save(ttsStatePath, ttsState);
 
   const validateState = () => {
     if (!Array.isArray(state.posts) || !Array.isArray(state.drafts)) throw new Error('日记状态格式错误。');
@@ -208,121 +192,7 @@ export function apply(ctx, rawConfig) {
       recentEvents: (proactiveState.eventDiag || []).slice(-15),
       log: (proactiveState.log || []).slice(-10),
     },
-    tts: {
-      enabled: config.ttsEnabled,
-      chance: config.ttsChance,
-      model: config.ttsModel,
-      apiBase: config.ttsApiBase,
-      hasKey: Boolean(String(config.ttsApiKey || '').trim()),
-      voicePrompt: config.ttsVoicePrompt,
-      optimizeText: config.ttsOptimizeText,
-      keepFiles: config.ttsKeepFiles,
-      voiceDir: voiceDir(),
-      log: (ttsState.log || []).slice(-10),
-      recent: (ttsState.log || []).slice(-10),
-      lastError: ttsState.lastError,
-    },
   });
-
-  // ── 语音合成（MiMo TTS · voicedesign 音色设计模式）────────────────────────
-  // 调用形态（OpenAI 兼容 /chat/completions）：
-  //   user      → 音色提示词（voicedesign 必填，就是「用一段话描述想要的声音」）
-  //   assistant → 要朗读的文本
-  //   audio     → { format: 'wav', optimize_text_preview? }
-  // 返回 base64 音频，落盘到 QQ 桥接的语音库目录，供 qq_send_voice 直接发出去。
-  function voiceDir() {
-    const bridge = load(bridgePath, null) || {};
-    const dir = String(bridge.socialV2?.voice?.dir || 'audio');
-    const root = String(config.bridgeRoot || '/opt/qq-bridge');
-    return path.isAbsolute(dir) ? dir : path.join(root, dir);
-  }
-  function logTts(text) {
-    ttsState.log = ttsState.log || [];
-    ttsState.log.push({ at: Date.now(), text });
-    if (ttsState.log.length > 40) ttsState.log = ttsState.log.slice(-40);
-    persistTts();
-  }
-  // 掷骰：这次回复要不要改发语音
-  function rollTts() {
-    if (!config.ttsEnabled) return false;
-    if (!String(config.ttsApiKey || '').trim()) return false;
-    const chance = Math.max(0, Math.min(100, Number(config.ttsChance) || 0));
-    return Math.random() * 100 < chance;
-  }
-  // 清洗待合成文本：去掉 markdown、代码块、链接、@ 等不适合朗读的内容
-  function cleanForSpeech(text) {
-    let s = String(text || '');
-    s = s.replace(/```[\s\S]*?```/g, '');
-    s = s.replace(/`([^`]*)`/g, '$1');
-    s = s.replace(/!\[[^\]]*\]\([^)]*\)/g, '');
-    s = s.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
-    s = s.replace(/https?:\/\/\S+/g, '');
-    s = s.replace(/^\s{0,3}#{1,6}\s*/gm, '');
-    s = s.replace(/^\s*[-*+]\s+/gm, '');
-    s = s.replace(/^\s*>\s*/gm, '');
-    s = s.replace(/[*_~]{1,3}/g, '');
-    s = s.replace(/@\S+/g, '');
-    s = s.replace(/\[[^\]\n]{1,10}\]/g, ''); // 表情标签 [doge] 这类
-    s = s.replace(/\n{2,}/g, '\n').replace(/[ \t]+/g, ' ').trim();
-    return s;
-  }
-  // 合成一段语音，返回写入语音库的文件名（相对语音库目录）
-  async function synthesize(text, signal) {
-    const speak = cleanForSpeech(text);
-    if (!speak) throw new Error('文本清洗后为空，跳过语音。');
-    if (speak.length > 2000) throw new Error(`待合成文本过长（${speak.length} 字），跳过语音。`);
-    const apiBase = String(config.ttsApiBase || '').trim().replace(/\/+$/, '');
-    if (!apiBase) throw new Error('未配置 TTS 接口地址。');
-    const key = String(config.ttsApiKey || '').trim();
-    if (!key) throw new Error('未配置 TTS 接口密钥。');
-    const model = String(config.ttsModel || '').trim() || 'mimo-v2.5-tts-voicedesign';
-    const voicePrompt = String(config.ttsVoicePrompt || '').trim();
-    if (!voicePrompt) throw new Error('未配置音色提示词（voicedesign 模式必填）。');
-
-    const messages = [{ role: 'user', content: voicePrompt }];
-    // optimize_text_preview=true 时可以让模型自己润色文本，此时 assistant 可省
-    if (!config.ttsOptimizeText) messages.push({ role: 'assistant', content: speak });
-    const audio = { format: 'wav' };
-    if (config.ttsOptimizeText) audio.optimize_text_preview = true;
-
-    const resp = await fetch(`${apiBase}/chat/completions`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-      body: JSON.stringify({ model, messages, audio, stream: false }),
-      signal: AbortSignal.any([signal || new AbortController().signal, AbortSignal.timeout(90000)]),
-    });
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => '');
-      throw new Error(`TTS 接口返回 HTTP ${resp.status}：${String(body).slice(0, 200)}`);
-    }
-    const json = await resp.json().catch(() => null);
-    const b64 = json?.choices?.[0]?.message?.audio?.data;
-    if (!b64 || typeof b64 !== 'string') throw new Error('TTS 响应里没有音频数据。');
-    const buf = Buffer.from(b64, 'base64');
-    if (!buf.length) throw new Error('TTS 返回的音频为空。');
-
-    const dir = voiceDir();
-    fs.mkdirSync(dir, { recursive: true });
-    const name = `fish-${new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}-${randomUUID().slice(0, 8)}.wav`;
-    fs.writeFileSync(path.join(dir, name), buf);
-    pruneVoices(dir);
-    return { name, bytes: buf.length, chars: speak.length, model };
-  }
-  // 清理旧文件：只动本插件生成的前缀，保留最近 keepFiles 个
-  function pruneVoices(dir) {
-    try {
-      const keep = Math.max(1, Number(config.ttsKeepFiles) || 30);
-      const files = fs.readdirSync(dir)
-        .filter(f => f.startsWith('fish-') && f.endsWith('.wav'))
-        .map(f => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs }))
-        .sort((a, b) => b.t - a.t);
-      for (const { f } of files.slice(keep)) {
-        try { fs.unlinkSync(path.join(dir, f)); } catch {}
-      }
-    } catch (e) {
-      ttsState.lastError = String((e && e.message) || e).slice(0, 200);
-    }
-  }
 
   // 生成：返回 { score, text }，LLM 输出 JSON
   async function generate(signal, topic = '') {
@@ -415,10 +285,10 @@ export function apply(ctx, rawConfig) {
   // ── 模型工具 ──
   ctx.tools.register({
     name: 'qzone_diary',
-    description: '仅管理员可管理机器人的 QQ 空间随笔与语音合成。post 让机器人直接发一条自己写的说说（收到指令时主动发，只受每日上限）；preview 生成一条随笔并评估发送概率；publish 按草稿 ID 发布；status 看计划和草稿；reconcile 恢复结果未知的发布；voice 用当前音色配置合成一段测试语音放进语音库。',
+    description: '仅管理员可管理机器人的 QQ 空间随笔。post 让机器人直接发一条自己写的说说（收到指令时主动发，只受每日上限）；preview 生成一条随笔并评估发送概率；publish 按草稿 ID 发布；status 看计划和草稿；reconcile 恢复结果未知的发布。',
     parameters: { type: 'object', properties: {
-      action: { type: 'string', enum: ['status', 'post', 'preview', 'publish', 'reconcile', 'voice'], description: '默认 status。' },
-      text: { type: 'string', description: 'post 必填：机器人自己写好的说说正文（一两句话）。voice 时是待合成的文本，不给则用一句默认测试词。' },
+      action: { type: 'string', enum: ['status', 'post', 'preview', 'publish', 'reconcile'], description: '默认 status。' },
+      text: { type: 'string', description: 'post 必填：机器人自己写好的说说正文（一两句话）。' },
       draftId: { type: 'string', description: 'publish 必填；使用 preview 或 status 返回的草稿 ID。' },
       topic: { type: 'string', description: 'preview 可选，侧重点。' },
       visibility: { type: 'integer', enum: [1, 4, 64], description: 'post 可选：可见范围，默认用全局设置。' },
@@ -431,17 +301,6 @@ export function apply(ctx, rawConfig) {
       authorize(exec);
       const action = args.action ?? 'status';
       if (action === 'status') { state = load(statePath, initialState); validateState(); return status(); }
-      // 语音试听：不落日记、不进活跃度，纯粹验证接口与音色
-      if (action === 'voice') {
-        const signal = AbortSignal.any([exec.signal, abort.signal, AbortSignal.timeout(90000)]);
-        const text = (typeof args.text === 'string' && args.text.trim()) || '这是一条测试语音，听听看这个音色怎么样。';
-        const started = Date.now();
-        const r = await synthesize(text, signal);
-        ttsState.lastError = null;
-        ttsState.lastFile = r.name;
-        logTts(`手动试听：${r.name}（${r.chars} 字 → ${(r.bytes / 1024).toFixed(1)} KB，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s）`);
-        return { ok: true, file: r.name, bytes: r.bytes, chars: r.chars, model: r.model, dir: voiceDir(), hint: '用 qq_send_voice 传入这个文件名即可发出去。' };
-      }
       if (!['post', 'preview', 'publish', 'reconcile'].includes(action)) throw new Error('无效 action。');
       const signal = AbortSignal.any([exec.signal, abort.signal, AbortSignal.timeout(90000)]);
       return exclusive(async () => {
@@ -1048,61 +907,11 @@ export function apply(ctx, rawConfig) {
       proactiveState.lastProactiveAt = Date.now();
       persistProactive();
       logProactive(`已主动回复（${pick.id}），DSH 会照常开一轮｜${等式}`);
-      // 语音化：按触发几率，把这一轮的回复再合成一条语音放进语音库
-      void maybeSpeak(pick.id, 之前连没中);
     } catch (e) {
       proactiveState.lastError = String((e && e.message) || e).slice(0, 200);
       persistProactive();
       logProactive(`followup 失败：${proactiveState.lastError}`);
     }
-  }
-
-  // 到了要发语音的时候：等这轮回复落地 → 取回复文本 → 合成 → 写进语音库
-  async function maybeSpeak(sid, missStreak) {
-    if (!config.ttsEnabled) return;
-    const chance = Math.max(0, Math.min(100, Number(config.ttsChance) || 0));
-    const roll = Math.random() * 100;
-    if (roll >= chance) {
-      logTts(`没掷中 ✗ 语音触发率掷出 ${roll.toFixed(1)}（触发率 ${chance}%）`);
-      return;
-    }
-    logTts(`掷中 ✓ 掷出 ${roll.toFixed(1)}（触发率 ${chance}%）准备把这轮回复转语音`);
-    try {
-      // 等这一轮跑完，拿到最新的 assistant 回复
-      const deadline = Date.now() + 120000;
-      let reply = '';
-      while (Date.now() < deadline) {
-        await new Promise(r => setTimeout(r, 1500));
-        const msgs = recentMsgs.get(sid) || [];
-        const last = msgs.slice().reverse().find(m => m.role === 'assistant');
-        if (last && last.time && last.time > (Date.now() - 120000)) { reply = last.text; break; }
-      }
-      if (!reply) throw new Error('等不到这一轮的回复文本，跳过语音。');
-      const started = Date.now();
-      const r = await synthesize(reply, abort.signal);
-      ttsState.lastError = null;
-      logTts(`合成完成：${r.name}（${r.chars} 字 → ${(r.bytes / 1024).toFixed(1)} KB，耗时 ${((Date.now() - started) / 1000).toFixed(1)}s，模型 ${r.model}）`);
-      ttsState.lastFile = r.name;
-      persistTts();
-      // 让 agent 知道语音已备好，它自己可以用 qq_send_voice 发出去
-      try {
-        await pickAgent(sid)?.followup(craftUserMessage(
-          `（系统提示，不是对方说的话）你刚才那条回复已经合成成语音了，放在语音库里，文件名是 ${r.name}。` +
-          `如果你想让对方听到声音，用 qq_send_voice 把它发出去；如果觉得现在不适合发语音，就忽略这条提示，别回复它。`
-        ));
-      } catch (e) {
-        logTts(`提示 agent 发语音失败（语音文件仍在语音库）：${String((e && e.message) || e).slice(0, 120)}`);
-      }
-    } catch (e) {
-      ttsState.lastError = String((e && e.message) || e).slice(0, 200);
-      logTts(`语音失败：${ttsState.lastError}`);
-    }
-  }
-  function pickAgent(sid) {
-    try {
-      for (const a of ctx.agents?.list?.() || []) if (String(a.id) === String(sid)) return a;
-    } catch {}
-    return null;
   }
 
   // 会话事件监听：抓消息 + 在 turn/end 时评估一次（直到下次对方回复）
