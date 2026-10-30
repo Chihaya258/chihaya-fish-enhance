@@ -426,7 +426,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
               })),
             h(Field, {
               label: '评估影响命中线幅度（%）',
-              hint: '分数 0 → 命中线 ×(1 − 这个数%)；分数 1 → 命中线 ×(1 + 这个数%)；分数 0.5 不变。默认 50。填 0 = 只影响间隔、不影响命中线。',
+              hint: '以 0.5 分为中心对称缩放：0.5 分 → ×1.00 不变；0 分 → ×(1 − 幅度%)；1 分 → ×(1 + 幅度%)。默认 50，即 0 分压到一半、1 分抬到一倍半。把这格填 0 → 评估只影响间隔，完全不动命中线。',
             },
               h(NumInput, {
                 value: cfg.proactiveEvalInfluence ?? 50, min: 0, max: 100,
