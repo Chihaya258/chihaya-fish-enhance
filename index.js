@@ -949,14 +949,15 @@ export function apply(ctx, rawConfig) {
           const t = eventText(event, 'assistant');
           if (t) pushMsg(sid, 'assistant', t);
         } else if (event.type === 'turn/end') {
+          // 非目标会话直接静默跳过，不写日志（免得把日志刷满没用的诊断）
+          if (!isTarget(sid)) { pendingEval.delete(sid); return; }
           if (!pendingEval.has(sid)) {
-            if (isTarget(sid)) logProactive(`诊断：目标会话 turn/end 到了，但没有待评估标记（本轮没有真人消息）`);
+            logProactive(`诊断：目标会话 turn/end 到了，但没有待评估标记（本轮没有真人消息）`);
             return;
           }
           pendingEval.delete(sid);
           if (!config.proactiveEnabled) { logProactive(`诊断：跳过评估 — 主动回复总开关是关的`); return; }
           if (!config.proactiveEvalEnabled) { logProactive(`诊断：跳过评估 — 对话评估开关是关的`); return; }
-          if (!isTarget(sid)) { logProactive(`诊断：跳过评估 — ${sid} 不在目标会话里`); return; }
           // 闸门：上次评估之后对方还没再说话 → 本轮不再评估（对方一回复就清掉这个标记）
           if (proactiveState.evaluatedSessions && proactiveState.evaluatedSessions[sid]) return;
           void (async () => {
