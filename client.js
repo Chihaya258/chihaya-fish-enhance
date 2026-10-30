@@ -305,13 +305,13 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
             h('div', { 'data-qzd-label': '' }, 'QQ 空间随笔'),
             h('div', { 'data-qzd-note': '' }, '从机器人近期发言整理随笔草稿，并按计划和概率发布。'),
             h('div', { 'data-qzd-label': '' }, '主动回复'),
-            h('div', { 'data-qzd-note': '' }, '到点主动搭话，并用大模型评估对话完毕性与紧急性来动态缩短回复间隔。'),
+            h('div', { 'data-qzd-note': '' }, '到点主动搭话，并用大模型给「现在该不该开口」打个分，据此动态调整间隔与命中线。'),
           ),
         ) : null,
         activeFeature === 'proactive' ? h('div', { 'data-qzd-feature': '' },
           h('div', { 'data-qzd-row': '' },
             h('span', { 'data-qzd-badge': '' }, st.proactive?.enabled ? '主动回复已开' : '主动回复关'),
-            st.proactive?.lastEval ? h('span', { 'data-qzd-badge': '' }, `最近评估：完毕 ${Math.round((st.proactive.lastEval.completeness ?? 0) * 100)}% / 紧急 ${Math.round((st.proactive.lastEval.urgency ?? 0) * 100)}%`) : null),
+            st.proactive?.lastEval ? h('span', { 'data-qzd-badge': '' }, `最近评估：${Math.round((st.proactive.lastEval.score ?? 0) * 100)}%`) : null),
           st.proactive?.nextProactiveAt ? h('div', { 'data-qzd-note': '' }, `下次主动回复尝试：${new Date(st.proactive.nextProactiveAt).toLocaleString('zh-CN', { hour12: false })}`) : null,
 
           h(Card, { title: '开关' },
@@ -330,7 +330,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
             })),
 
           h(Card, { title: '骰子' },
-            h(Para, null, '每轮掷一个 0~100 的数，比命中线小就开口。命中线 = （峰时或谷时的那格命中线）× 时机因子，再加上攒下来的没中加成。'),
+            h(Para, null, '每轮掷一个 0~100 的数，比命中线小就开口。命中线 = （峰时或谷时的那格命中线）× 时机因子 × 评估系数，再加上攒下来的没中加成。'),
             h(Field, {
               label: '掷骰子间隔（分钟）',
               hint: '默认 30。范围 1~1440；改完保存，下一轮就按新间隔走（不用重启）。',
@@ -364,6 +364,30 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
                 onCommit: (v) => patch({ proactiveMissBonusMax: Number(v) }, '加成上限'),
               })),
             h(Para, null, '掷中（含试运行掷中）就清零，从头开始；连着没中就一次一次往上加，加到上限为止。'),
+            h(Field, {
+              label: '保底：连没中几次后启用',
+              hint: '连续没掷中达到这么多次，本轮命中线直接抬到下面的保底值（默认 4 次）。填很大的数 = 不启用保底。',
+            },
+              h(NumInput, {
+                value: cfg.proactiveMissFloorStreak ?? 4, min: 1, max: 100,
+                onCommit: (v) => patch({ proactiveMissFloorStreak: Number(v) }, '保底阈值'),
+              })),
+            h(Field, {
+              label: '保底命中线',
+              hint: '触发保底后命中线不低于此值（默认 65）。不会突破时机因子：对方刚说完话时照样打折，避免硬闯打断。',
+            },
+              h(NumInput, {
+                value: cfg.proactiveMissFloor ?? 65, min: 0, max: 100,
+                onCommit: (v) => patch({ proactiveMissFloor: Number(v) }, '保底命中线'),
+              })),
+            h(Field, {
+              label: '命中线上限',
+              hint: '命中线再高也封顶到这个值（默认 95），防止出现「必然开口」。',
+            },
+              h(NumInput, {
+                value: cfg.proactiveChanceCap ?? 95, min: 1, max: 100,
+                onCommit: (v) => patch({ proactiveChanceCap: Number(v) }, '命中线上限'),
+              })),
             h(Para, null, '这两格只影响自动的定时掷骰；手动按钮（演练/真发）不掷骰子，也不动这个计数器。'),
             h(Warn, null, `「连着没中」这个数只记在内存里：DSH 一重启就回到 0。当前连没中 ${st.proactive?.missStreak ?? 0} 次。`),
             h(Field, {
@@ -383,30 +407,37 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
                 h('span', { 'data-qzd-unit': '' }, '点'))),
             h(Warn, null, `两个数字填成一样（比如 8 和 8）= 不启用安静时段：整天都可能掷骰子。现在是 ${cfg.proactiveQuietStart ?? 1}~${cfg.proactiveQuietEnd ?? 8} 点。`)),
 
-          h(Card, { title: '对话评估（聊到什么程度了 → 决定多快再开口）' },
-            h(Para, null, '每一轮对话结束后，让大模型看一眼刚才聊的内容，给两个 0~1 的分：'),
-            h(Para, null, '· 完毕性 —— 对方话是不是说完了、这个话题是不是收尾了。· 紧急性 —— 现在是不是需要赶紧接一句。'),
-            h(Para, null, '两个分越高，下一次主动开口的间隔就越短（最多缩到下面那个幅度）。'),
+          h(Card, { title: '对话评估（聊到什么程度了 → 决定多快、多容易开口）' },
+            h(Para, null, '每一轮对话结束后，让大模型看一眼刚才聊的内容，给一个 0~1 的分数：'),
+            h(Para, null, '分数高 = 对方话没说完/在等你接/情绪需要接住，该开口；分数低 = 已经收尾了、插进去反而突兀。模型会综合判断话题是否悬而未决、有没有直接问机器人、情绪浓度、距上次发言多久。'),
             h(ToggleRow, {
               label: '开启对话评估',
-              note: '关着 = 不做评估，永远按「掷骰子间隔」那格走，不缩短。',
+              note: '关着 = 不做评估，间隔和命中线都按固定参数走。',
               on: cfg.proactiveEvalEnabled !== false,
               onChange: (v) => patch({ proactiveEvalEnabled: v }, '对话评估'),
             }),
             h(Field, {
               label: '评估缩短幅度（%）',
-              hint: '综合分 = （完毕性 + 紧急性）÷ 2。综合分 0 → 间隔不缩；综合分 1 → 间隔缩到基础间隔的 (100 − 这个数)%。默认 70（即最快缩到 30%）。',
+              hint: '分数 0 → 间隔不缩；分数 1 → 间隔缩到基础间隔的 (100 − 这个数)%。默认 70（即最快缩到 30%）。',
             },
               h(NumInput, {
                 value: cfg.proactiveEvalShrink ?? 70, min: 0, max: 100,
                 onCommit: (v) => patch({ proactiveEvalShrink: Number(v) }, '缩短幅度'),
               })),
+            h(Field, {
+              label: '评估影响命中线幅度（%）',
+              hint: '分数 0 → 命中线 ×(1 − 这个数%)；分数 1 → 命中线 ×(1 + 这个数%)；分数 0.5 不变。默认 50。填 0 = 只影响间隔、不影响命中线。',
+            },
+              h(NumInput, {
+                value: cfg.proactiveEvalInfluence ?? 50, min: 0, max: 100,
+                onCommit: (v) => patch({ proactiveEvalInfluence: Number(v) }, '评估影响'),
+              })),
             h(Ok, null, '√ 同一轮对话只评一次：对方回复之前不会再评，对方一开口就重新计一次。'),
             h('div', { 'data-qzd-summary': '' },
               `最近一次评估：${st.proactive?.lastEval
-                ? `完毕性 ${Math.round((st.proactive.lastEval.completeness ?? 0) * 100)}% · 紧急性 ${Math.round((st.proactive.lastEval.urgency ?? 0) * 100)}% · 综合 ${Math.round((st.proactive.lastEval.score ?? 0) * 100)}%`
+                ? `${Math.round((st.proactive.lastEval.score ?? 0) * 100)}%${st.proactive.lastEval.reason ? `（${st.proactive.lastEval.reason}）` : ''}　→　命中线系数 ×${(st.proactive.evalFactor ?? 1).toFixed(2)}`
                 : '还没评过'}　→　当前实际间隔 ${st.proactive?.effectiveIntervalMin ?? cfg.proactiveIntervalMin} 分钟（基础 ${cfg.proactiveIntervalMin} 分钟）`),
-            h(Warn, null, '评估要花一次很短的模型调用。嫌费就把上面那格关掉，间隔就不受分数影响了。')),
+            h(Warn, null, '评估要花一次很短的模型调用。嫌费就把上面那格关掉，间隔和命中线都不受分数影响了。')),
 
           h(Card, { title: '时机因子（刚聊过就少开口，冷太久了就多开口）' },
             h('div', { 'data-qzd-flabel': '' }, '近：刚聊过 → 命中线 ×' + (cfg.proactiveNearFactor ?? 0.15)),
@@ -462,7 +493,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
                 placeholder: '留空 = 本机时区',
                 onChange: (e) => patch({ proactivePeakTz: e.target.value }, '峰谷时区'),
               })),
-            h(Para, null, '最终命中线 = 这格（看是峰时还是谷时）× 时机因子 + 攒下来的没中加成（最后夹在 0~100）。'),
+            h(Para, null, '最终命中线 = 这格（看是峰时还是谷时）× 时机因子 × 评估系数 + 攒下来的没中加成，再加保底、封上限。'),
             h(Warn, null, '两个数字填成一样 = 不分峰谷，全天一个命中线'),
             (() => {
               const qs = cfg.proactiveQuietStart ?? 1, qe = cfg.proactiveQuietEnd ?? 8;
