@@ -23,6 +23,7 @@ export const Config = z.object({
   proactiveIntervalMin: z.number().min(1).max(1440).default(30).description('主动回复基础间隔（分钟）'),
   proactiveEvalEnabled: z.boolean().default(true).description('每轮对话后用大模型评估完毕性/紧急性，据此缩短主动回复间隔'),
   proactiveEvalShrink: z.number().min(0).max(100).default(70).description('评估缩短幅度（%）：综合分 1 时间隔缩到基础间隔的 (100-该值)%'),
+  proactiveEvalInfluence: z.number().min(0).max(100).default(50).description('评估影响命中线的幅度（%）：综合分 0 → 命中线 ×(1-该值%)，综合分 1 → ×(1+该值%)，综合分 0.5 不变'),
   proactiveChance: z.number().step(1).min(0).max(100).default(50).description('谷时命中线（0~100，掷到以下才回复）'),
   proactivePeakChance: z.number().step(1).min(0).max(100).default(20).description('峰时命中线（0~100；周一~五 9-12/14-18 点为峰时）'),
   proactivePeakTz: z.string().max(64).default('').description('峰谷判断时区（IANA 名，留空=本机时区）'),
@@ -171,6 +172,8 @@ export function apply(ctx, rawConfig) {
       intervalMin: config.proactiveIntervalMin,
       evalEnabled: config.proactiveEvalEnabled,
       evalShrink: config.proactiveEvalShrink,
+      evalInfluence: config.proactiveEvalInfluence,
+      evalFactor: config.proactiveEvalEnabled ? 1 + (effectiveScore() * 2 - 1) * (Math.max(0, Math.min(100, Number(config.proactiveEvalInfluence) || 0)) / 100) : 1,
       effectiveIntervalMin: Math.round(computeIntervalMs(effectiveScore()) / 60000),
       chance: config.proactiveChance,
       peakChance: config.proactivePeakChance,
@@ -182,6 +185,8 @@ export function apply(ctx, rawConfig) {
       lastProactiveAt: proactiveState.lastProactiveAt ? new Date(proactiveState.lastProactiveAt).toISOString() : null,
       nextProactiveAt: proactiveState.nextProactiveAt ? new Date(proactiveState.nextProactiveAt).toISOString() : null,
       lastError: proactiveState.lastError,
+      evaluatedSessions: proactiveState.evaluatedSessions || {},
+      recentEvents: (proactiveState.eventDiag || []).slice(-15),
       log: (proactiveState.log || []).slice(-10),
     },
   });
@@ -708,7 +713,8 @@ export function apply(ctx, rawConfig) {
     return h >= s || h < e; // 跨午夜
   }
 
-  // ── 命中线计算：档位命中线 × 时机因子 + 没中加成，夹 0~100（先乘因子再加加成）──
+  // ── 命中线计算：档位命中线 × 时机因子 × 评估系数 + 没中加成，夹 0~100（先乘因子再加加成）──
+  // 评估系数：综合分 0 → ×(1-influence)，0.5 → ×1，1 → ×(1+influence)，让「对话评估」真正影响这次开不开口
   function computeChanceLine(at, sinceUserMin) {
     const peak = isPeak(at, config.proactivePeakTz);
     const base = peak ? config.proactivePeakChance : config.proactiveChance;
@@ -717,9 +723,21 @@ export function apply(ctx, rawConfig) {
       if (sinceUserMin < config.proactiveNearMin) factor = config.proactiveNearFactor;
       else if (sinceUserMin > config.proactiveFarMin) factor = config.proactiveFarFactor;
     }
+    // 评估关闭时系数恒为 1（不影响命中线）；effectiveScore() 在关闭时本就返回 0，这里再无条件保底
+    const evalScore = effectiveScore();
+    const influence = Math.max(0, Math.min(100, Number(config.proactiveEvalInfluence) || 0)) / 100;
+    const evalFactor = config.proactiveEvalEnabled ? 1 + (evalScore * 2 - 1) * influence : 1;
     const bonus = Math.min(config.proactiveMissBonusMax, proactiveMissStreak * config.proactiveMissBonus);
-    const line = Math.min(100, Math.max(0, base * factor + bonus));
-    return { peak, base, factor, bonus, line };
+    const line = Math.min(100, Math.max(0, base * factor * evalFactor + bonus));
+    return { peak, base, factor, evalScore, evalFactor, bonus, line };
+  }
+  // 把命中线算式拼成一行可读文本（写进日志）
+  function chanceLineText(calc, sinceUserMin) {
+    const 距离 = sinceUserMin === undefined ? '距上次说话时间不明' : `距对方上次说话 ${sinceUserMin.toFixed(1)} 分钟`;
+    const evalPart = config.proactiveEvalEnabled
+      ? ` × 评估系数 ${calc.evalFactor.toFixed(2)}（综合 ${calc.evalScore.toFixed(2)}）`
+      : '';
+    return `${calc.line.toFixed(1)} = ${calc.peak ? '峰时' : '谷时'}命中线 ${calc.base}% × 时机因子 ${calc.factor}（${距离}）${evalPart}${calc.bonus > 0 ? ` + 没中加成 ${calc.bonus.toFixed(1)}` : ''}`;
   }
   function rescheduleProactive() {
     if (!config.proactiveEnabled) { proactiveState.nextProactiveAt = null; persistProactive(); return; }
@@ -841,16 +859,17 @@ export function apply(ctx, rawConfig) {
     }
     const pick = available[Math.floor(Math.random() * available.length)];
 
-    // 命中线 = 档位（峰/谷）× 时机因子 + 没中加成，夹 0~100
+    // 命中线 = 档位（峰/谷）× 时机因子 × 评估系数 + 没中加成，夹 0~100
     const sinceUserMin = recentMsgs.get(pick.id)?.slice().reverse().find(m => m.role === 'user');
     const sinceMin = sinceUserMin && sinceUserMin.time ? (Date.now() - sinceUserMin.time) / 60000 : undefined;
     const calc = computeChanceLine(now, sinceMin);
     const roll = Math.random() * 100;
-    const 距离 = sinceMin === undefined ? '距上次说话时间不明' : `距对方上次说话 ${sinceMin.toFixed(1)} 分钟`;
-    const 等式 = `${calc.line.toFixed(1)} = ${calc.peak ? '峰时' : '谷时'}命中线 ${calc.base}% × 时机因子 ${calc.factor}（${距离}）${calc.bonus > 0 ? ` + 没中加成 ${calc.bonus.toFixed(1)}` : ''}`;
+    const 等式 = chanceLineText(calc, sinceMin);
     if (roll >= calc.line) {
       proactiveMissStreak += 1;
-      logProactive(`没掷中 ✗ 掷出 ${roll.toFixed(1)}（命中线 ${calc.line.toFixed(1)}）｜${等式}｜下次命中线 ${(Math.min(100, calc.base * calc.factor + Math.min(config.proactiveMissBonusMax, proactiveMissStreak * config.proactiveMissBonus))).toFixed(1)}`);
+      const 下次加成 = Math.min(config.proactiveMissBonusMax, proactiveMissStreak * config.proactiveMissBonus);
+      const 下次线 = Math.min(100, Math.max(0, calc.base * calc.factor * calc.evalFactor + 下次加成));
+      logProactive(`没掷中 ✗ 掷出 ${roll.toFixed(1)}（命中线 ${calc.line.toFixed(1)}）｜${等式}｜下次命中线 ${下次线.toFixed(1)}`);
       return;
     }
     const 之前连没中 = proactiveMissStreak;
@@ -874,12 +893,23 @@ export function apply(ctx, rawConfig) {
   }
 
   // 会话事件监听：抓消息 + 在 turn/end 时评估一次（直到下次对方回复）
+  // 诊断：记录最近收到的 session/event 摘要，方便确认事件通道是否通畅
+  if (!Array.isArray(proactiveState.eventDiag)) proactiveState.eventDiag = [];
+  const noteEvent = (sid, type, extra) => {
+    try {
+      proactiveState.eventDiag.push({ at: Date.now(), sid: String(sid || '').slice(0, 40), type: String(type || ''), extra: extra || '' });
+      if (proactiveState.eventDiag.length > 40) proactiveState.eventDiag = proactiveState.eventDiag.slice(-40);
+    } catch {}
+  };
   ctx.effect(() => {
     const off = ctx.on('session/event', (session, event) => {
       try {
         const sid = String(session && session.id ? session.id : '');
         if (!sid) return;
         if (!event || typeof event.type !== 'string') return;
+        if (event.type === 'user/message' || event.type === 'assistant/message' || event.type === 'turn/end') {
+          noteEvent(sid, event.type, isTarget(sid) ? 'target' : '');
+        }
         if (event.type === 'user/message') {
           const src = event.data && event.data.source;
           const isSelf = src && src.kind === 源标记;
@@ -897,11 +927,14 @@ export function apply(ctx, rawConfig) {
           const t = eventText(event, 'assistant');
           if (t) pushMsg(sid, 'assistant', t);
         } else if (event.type === 'turn/end') {
-          if (!pendingEval.has(sid)) return;
+          if (!pendingEval.has(sid)) {
+            if (isTarget(sid)) logProactive(`诊断：目标会话 turn/end 到了，但没有待评估标记（本轮没有真人消息）`);
+            return;
+          }
           pendingEval.delete(sid);
-          if (!config.proactiveEnabled) return;
-          if (!config.proactiveEvalEnabled) return;
-          if (!isTarget(sid)) return;
+          if (!config.proactiveEnabled) { logProactive(`诊断：跳过评估 — 主动回复总开关是关的`); return; }
+          if (!config.proactiveEvalEnabled) { logProactive(`诊断：跳过评估 — 对话评估开关是关的`); return; }
+          if (!isTarget(sid)) { logProactive(`诊断：跳过评估 — ${sid} 不在目标会话里`); return; }
           // 闸门：上次评估之后对方还没再说话 → 本轮不再评估（对方一回复就清掉这个标记）
           if (proactiveState.evaluatedSessions && proactiveState.evaluatedSessions[sid]) return;
           void (async () => {
