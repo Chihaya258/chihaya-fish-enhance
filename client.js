@@ -490,7 +490,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
         ) : null,
         activeFeature === 'overview' ? h('div', { 'data-qzd-feature': '' },
           h('div', { 'data-qzd-card': '' },
-            h('div', { 'data-qzd-card-title': '' }, 'QQ 机器人加强插件'),
+            h('div', { 'data-qzd-card-title': '' }, '肥鱼增强'),
             h('div', { 'data-qzd-note': '' }, '这里将集中管理机器人的扩展功能。当前已接入 QQ 空间、主动回复与语音聊天，后续可继续添加消息、群管理、定时任务等功能。'),
           ),
           h('div', { 'data-qzd-card': '' },
@@ -815,7 +815,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
       apply(ctx) {
         const slots = ctx.get('slots');
         slots.inject('settings.section', () => slots.register(
-          { name: 'settings.section', id: 'qzone-diary', order: 55, label: 'QQ机器人加强插件' },
+          { name: 'settings.section', id: 'qzone-diary', order: 55, label: '肥鱼增强' },
           () => h(Panel),
         ));
       },
