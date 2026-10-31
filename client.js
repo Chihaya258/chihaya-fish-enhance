@@ -38,6 +38,7 @@ window.__ModuleLoader__.load({
 [data-qzd-grow]{flex:1;min-width:0;}
 [data-qzd-label]{font-size:13px;}
 [data-qzd-note]{font-size:11px;line-height:16px;color:var(--dsw-alias-label-tertiary,#9aa0a6);}
+[data-qzd-drop] [data-qzd-note]{color:#b8bec8;}
 [data-qzd-sub]{margin-left:14px;padding-left:12px;border-left:2px solid var(--dsw-alias-border-l2,rgba(255,255,255,.1));display:flex;flex-direction:column;gap:10px;}
 [data-qzd-badge]{font-size:11px;padding:2px 7px;border-radius:6px;
   background:var(--dsw-alias-bg-overlay,rgba(128,128,128,.14));color:var(--dsw-alias-label-secondary,#c9ccd1);}
@@ -82,7 +83,9 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
 [data-qzd-chip-x]:hover{opacity:1;background:rgba(128,128,128,.28);}
 [data-qzd-drop]{position:absolute;top:100%;left:0;z-index:20;margin-top:6px;width:min(380px,100%);padding:8px;border-radius:10px;
   display:flex;flex-direction:column;gap:6px;box-shadow:0 8px 24px rgba(0,0,0,.35);
-  background:var(--dsw-alias-bg-elevated,#24262b);border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.14));}
+  background:var(--dsw-alias-bg-elevated,#24262b);color:#f3f4f6;border:1px solid var(--dsw-alias-border-l2,rgba(255,255,255,.14));}
+[data-qzd-drop] [data-qzd-input]{background:rgba(0,0,0,.22);color:#f3f4f6;border-color:rgba(255,255,255,.2);}
+[data-qzd-drop] [data-qzd-input]::placeholder{color:#aeb4be;opacity:1;}
 [data-qzd-droplist]{max-height:200px;overflow:auto;display:flex;flex-direction:column;gap:2px;}
 [data-qzd-dropitem]{display:flex;flex-direction:column;gap:3px;text-align:left;width:100%;padding:8px 10px;border:0;border-radius:7px;
   background:transparent;color:inherit;cursor:pointer;font:inherit;font-size:13px;}
@@ -489,6 +492,18 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
               `${new Date(l.at).toLocaleTimeString('zh-CN', { hour12: false })} · ${l.text}`))) : null,
         ) : null,
         activeFeature === 'overview' ? h('div', { 'data-qzd-feature': '' },
+          st?.bridgeReady === false ? h('div', { 'data-qzd-card': '' },
+            h('div', { 'data-qzd-card-title': '' }, '桥接还没配好'),
+            st?.bridgeProblems?.length
+              ? h(Warn, null, st.bridgeProblems.join('；'))
+              : h(Warn, null, '还没有设置 QQ 桥接目录。'),
+            h(Field, { label: '桥接目录（绝对路径）', hint: '指向 QQ 桥接（SnowLuma）的安装目录，里面有 config.json 与 state/。填完点一下别处即保存。' },
+              h('input', {
+                'data-qzd-input': '', placeholder: '例如 /opt/qq-bridge',
+                defaultValue: st?.bridgeRoot || '',
+                onBlur: (e) => { const v = e.target.value.trim(); if (v && v !== st?.bridgeRoot) patch({ bridgeRoot: v }, '桥接目录'); },
+              })),
+          ) : null,
           h('div', { 'data-qzd-card': '' },
             h('div', { 'data-qzd-card-title': '' }, '肥鱼增强'),
             h('div', { 'data-qzd-note': '' }, '这里将集中管理机器人的扩展功能。当前已接入 QQ 空间、主动回复与语音聊天，后续可继续添加消息、群管理、定时任务等功能。'),

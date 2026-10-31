@@ -1,4 +1,4 @@
-# chihaya-fish-enhance（QQ 机器人加强插件）
+# 肥鱼增强（chihaya-fish-enhance / Fish Enhance）
 
 面向 QQ 机器人的可扩展加强插件。目前包含三块功能：
 
@@ -9,6 +9,7 @@
 Web 设置页按功能分区，后续可继续添加更多机器人能力。
 
 > 仅供上传/分发准备用的源码快照，不含 `node_modules`。
+> **装上不等于能用**：它依赖本机 QQ 桥接，装完必须先在设置页填「桥接目录」并打开各项开关，见[前置条件](#前置条件装之前先确认)。
 
 ---
 
@@ -31,15 +32,17 @@ Web 设置页按功能分区，后续可继续添加更多机器人能力。
 ## 文件结构
 
 ```
-qzone-diary/
+（仓库根目录就是插件本体，没有外层目录）
 ├── index.js            # 宿主端：模型工具 + 调度循环 + HTTP 设置页 API
-├── client.js           # 客户端：机器人加强插件设置页（功能总览 + QQ 空间子菜单）
+├── tts.js              # Breeze Blue 语音合成请求与文本清洗
+├── client.js           # 客户端：设置页（功能总览 + 各功能子菜单）
 ├── cordis.patch.yml    # bundle 补丁：注册插件并写入默认配置
 ├── icon.svg            # 插件图标
 ├── package.json        # 包元信息（name: chihaya-fish-enhance）
-└── locale/
-    ├── zh.json         # 中文元信息
-    └── en.json         # 英文元信息
+├── locale/
+│   ├── zh.json         # 中文元信息
+│   └── en.json         # 英文元信息
+└── *.test.js           # 单测（tts / 发送出口）
 ```
 
 ---
@@ -47,7 +50,7 @@ qzone-diary/
 ## 依赖
 
 - **运行时依赖**：无（纯 Node 内置 `fs` / `path` / `crypto`）。
-- **peerDependency**：`@deepseek-ai/schemastery >= 3.18.0`（仅用于 `Config` schema，由宿主提供）。
+- **peerDependency**：`@deepseek-ai/schemastery >= 3.18.0`（`Config` schema）、`@deepseek-ai/dsh-llm`（`createUserMessage`）。两者都由宿主提供，宿主那边有就行。
 
 > 本仓库未包含 `node_modules`。本地原目录里 `node_modules/@deepseek-ai/schemastery` 只是指向宿主 `/opt/dsh/node_modules/...` 的符号链接，属于 peer 依赖，上传时无需携带。
 
@@ -57,7 +60,7 @@ qzone-diary/
 
 | 键 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `bridgeRoot` | string | `/opt/qq-bridge` | QQ 桥接目录（须绝对路径） |
+| `bridgeRoot` | string | `''`（未配置） | QQ 桥接目录（须绝对路径）。**首次使用请在设置页填写**；留空时插件仍能加载，只是功能不可用 |
 | `publishEnabled` | boolean | `false` | 总发布闸，关闭时只存草稿 |
 | `intervalHours` | number | `8` | 调度尝试间隔（1–168 小时） |
 | `randomJitterMinutes` | number | `180` | 间隔随机噪声（0–1440 分钟） |
@@ -78,7 +81,7 @@ qzone-diary/
 | `voiceChance` | number | `30` | 全局语音概率（0–100，按轮掷骰） |
 | `voiceTargetSessions` | string[] | `[]` | 生效会话；空=所有绑定了 QQ 的会话 |
 | `voiceApiBase` | string | `https://api.breeze.blue/v1` | Breeze Blue 接口根 |
-| `voiceApiKey` | string | `''` | `xi-api-key` |
+| `voiceApiKey` | string | `''` | `xi-api-key`。**只写不读**：接口回传时一律显示为 `***` |
 | `voiceVoiceId` | string | `''` | 音色 ID（`voc_…`） |
 | `voiceModelId` | string | `''` | 模型 ID，空=服务端自动 |
 | `voiceLanguageCode` | string | `zh` | 语言代码 |
@@ -132,31 +135,78 @@ Authorization: Bearer {accessToken}
 
 ---
 
-## 安装（本机 DSH，参考《DSH 开发手册》）
+## 前置条件（装之前先确认）
+
+插件依赖 QQ 桥接（SnowLuma）的**目录**，不是它的公开 API。缺了下面任何一项，插件依然能装、设置页也打得开，但功能不可用，设置页顶部会列出缺什么。
+
+| 项 | 说明 |
+|---|---|
+| **QQ 桥接目录** | 一个绝对路径，里面有 `config.json` 和 `state/`。默认不填，**首次使用在设置页「功能总览」里填写** |
+| `config.json` | 读取 `ownerQQ`、`consolePort`、`snowluma.httpUrl/accessToken`、`socialV2.voice.*` |
+| `state/social-v2.json` | 素材来源与 `conversations[key].agentToken` |
+| `state/sessions.json` | DSH 会话 ↔ QQ 会话 的映射（鉴权与语音目标都用它） |
+| `state/console-token` | 调桥接控制台接口用 |
+| **桥接运行在 `reserved2` 模式** | 语音走 `/api/socialV2/send-voice`，别的模式会被拒 |
+| **桥接侧开关** | `socialV2.voice.enabled: true`、`socialV2.tools.sendVoice: true` |
+| **工具白名单** | `qzone_diary` 要过桥接的 `qq-tool-restrict.mjs` 那道闸 |
+
+> ⚠️ 这些是桥接的内部实现细节。桥接改字段名，插件会**静默失效**（不报错，只是发不出去）。装之前建议先去桥接里核对一遍。
+
+### 三项功能默认全关
+
+| 功能 | 开关 | 默认 |
+|---|---|---|
+| QQ 空间随笔 | `publishEnabled` | `false`（只存草稿） |
+| 主动回复 | `proactiveEnabled` / `proactiveDryRun` | `false` / `true` |
+| 语音聊天 | `voiceEnabled` / `voiceDryRun` | `false` / `true` |
+
+装上不配置，什么都不会发生。这是有意的安全默认。
+
+### 语音额外需要
+
+1. **Breeze Blue 的密钥**（`voiceApiKey`）和**音色 ID**（`voiceVoiceId`），两个都有才会启用语音。
+2. 桥接侧 `socialV2.voice.enabled` 与 `socialV2.tools.sendVoice`，且桥接跑在 `reserved2`。
+
+---
+
+## 安装
+
+下面的路径按本机 DSH 习惯写，别的宿主请照搬思路改路径。
 
 ```bash
-# 1. 放入插件目录
-cp -r qzone-diary /root/.dsh/plugins/qzone-diary
+# 1. 把插件放到一个目录（仓库根目录就是插件本体）
+git clone git@github.com:Chihaya258/chihaya-fish-enhance.git /root/.dsh/plugins/chihaya-fish-enhance
+#    或者直接 cp -r <仓库根> /root/.dsh/plugins/chihaya-fish-enhance
 
-# 2. 注册进 web profile（bundle 里写包名 chihaya-fish-enhance）
+# 2. 装 peer 依赖（由宿主提供，软链过去即可）
+ln -sfn /opt/dsh/node_modules/@deepseek-ai /root/.dsh/plugins/chihaya-fish-enhance/node_modules/@deepseek-ai
+
+# 3. 注册进 web profile（bundle 里写包名 chihaya-fish-enhance）
 cd /root/.dsh/profiles/web
 node -e "
 const fs=require('fs');
 const p=JSON.parse(fs.readFileSync('package.json','utf8'));
-p.dependencies['chihaya-fish-enhance']='link:/root/.dsh/plugins/qzone-diary';
+p.dependencies['chihaya-fish-enhance']='link:/root/.dsh/plugins/chihaya-fish-enhance';
 p.dsh.profile.bundles.push('chihaya-fish-enhance');
 fs.writeFileSync('package.json', JSON.stringify(p,null,2)+'\n');
 "
-ln -sfn /root/.dsh/plugins/qzone-diary node_modules/chihaya-fish-enhance
+ln -sfn /root/.dsh/plugins/chihaya-fish-enhance node_modules/chihaya-fish-enhance
 
-# 3. 重启
-systemctl restart dsh-web
-
-# 4. 工具白名单：qzone_diary 需在 QQ 桥接 qq-tool-restrict.mjs 放行
-#    （SAFE_PREFIXES 加 qzone_ 前缀，或 SAFE_EXACT 加 qzone_diary）
+# 4. 重启 dsh-web（按你的部署方式，比如 systemctl restart dsh-web）
 ```
 
-> 注意：插件注册了模型工具 `qzone_diary`，需过 QQ 桥接白名单那道闸（见开发手册「QQ 桥接工具白名单」一节）。
+**5. 打开设置页 →「肥鱼增强」→ 功能总览 → 填「桥接目录」**，例如 `/opt/qq-bridge`。填完点一下别处即保存，上面的未配置提示会消失。
+
+**6. 工具白名单**：`qzone_diary` 需在桥接的 `qq-tool-restrict.mjs` 里放行（`SAFE_PREFIXES` 加 `qzone_` 前缀，或 `SAFE_EXACT` 加 `qzone_diary`）。
+
+---
+
+## 安全说明
+
+- `voiceApiKey` 会以明文写进 `{bridgeRoot}/state/qzone-diary-config.json`（后端要靠它发请求，无法避免落盘）。
+- **读取方向全部打了码**：`GET /api/qzone-diary/config` 与 `/voice/key` 只返回 `***`，判断有没有配过请看 `hasKey`。
+- 设置页的密钥框是空的，留空表示不改，不会把 `***` 写回磁盘。
+- 分享这个插件给别人时，注意不要连 `state/qzone-diary-config.json` 一起打包。
 
 ---
 

@@ -9,7 +9,7 @@ import { requestSpeech, cleanForSpeech, describeError, MAX_TEXT_CHARS, DEFAULT_B
 export const inject = ['tools', 'llm', 'agentDefaultModel', 'webServer', 'agents', 'sessions', 'sessionTitle', 'workspaceRegistry'];
 
 export const Config = z.object({
-  bridgeRoot: z.string().default('/opt/qq-bridge').description('QQ 桥接目录'),
+  bridgeRoot: z.string().default('').description('QQ 桥接目录（首次使用请在设置页填写绝对路径，例如 /opt/qq-bridge）'),
   adminSessionIds: z.array(z.string()).default([]).description('额外允许管理日记的 DSH 会话 ID'),
   publishEnabled: z.boolean().default(false).description('总发布闸：关闭时只存草稿不真发'),
   intervalHours: z.number().min(1).max(168).default(8).description('每次尝试的间隔（小时）'),
@@ -141,21 +141,62 @@ function checkText(text, bridge, maxChars) {
 
 export function apply(ctx, rawConfig) {
   const cordisConfig = Config(rawConfig ?? {});
-  if (!path.isAbsolute(cordisConfig.bridgeRoot)) throw new Error('bridgeRoot 必须是绝对路径。');
-  const bridgePath = path.join(cordisConfig.bridgeRoot, 'config.json');
-  const sourcePath = path.join(cordisConfig.bridgeRoot, 'state/social-v2.json');
-  const statePath = path.join(cordisConfig.bridgeRoot, 'state/qzone-diary.json');
-  const configPath = path.join(cordisConfig.bridgeRoot, 'state/qzone-diary-config.json');
-  fs.accessSync(bridgePath, fs.constants.R_OK);
-  fs.accessSync(sourcePath, fs.constants.R_OK);
-  fs.accessSync(path.dirname(statePath), fs.constants.W_OK);
+  const bridgeRootOf = (value) => {
+    const s = String(value ?? '').trim();
+    return s && path.isAbsolute(s) ? path.resolve(s) : '';
+  };
+  const initialRoot = bridgeRootOf(cordisConfig.bridgeRoot);
+  if (String(cordisConfig.bridgeRoot ?? '').trim() && !initialRoot) {
+    ctx.logger?.warn?.(`fish-enhance: bridgeRoot 需要绝对路径，收到「${cordisConfig.bridgeRoot}」，已先按未配置处理；请到设置页填写。`);
+  }
+
+  const hotConfigPathOf = (root) => (root ? path.join(root, 'state/qzone-diary-config.json') : '');
+  /** 先读盘上的热配置，拿到用户填过的 bridgeRoot（默认值不再指向作者机器）。 */
+  function resolveRoot() {
+    const persisted = load(hotConfigPathOf(initialRoot), {});
+    return bridgeRootOf(persisted.bridgeRoot)
+      || bridgeRootOf(cordisConfig.bridgeRoot)
+      || initialRoot;
+  }
+  let currentRoot = resolveRoot();
+  // 路径全部延迟解析：桥接目录缺失时插件照常加载，只把状态标成未配置。
+  const bridgeRoot = () => currentRoot;
+  const bridgeFile = (...parts) => (currentRoot ? path.join(currentRoot, ...parts) : '');
+
+  /** 启动自检：返回所有没配好的项，供设置页显示。不抛错。 */
+  function bridgeProblems() {
+    if (!currentRoot) return ['还没有设置 QQ 桥接目录（bridgeRoot）'];
+    const problems = [];
+    const checks = [
+      [path.join(currentRoot, 'config.json'), fs.constants.R_OK, '桥接 config.json 读不到'],
+      [path.join(currentRoot, 'state/social-v2.json'), fs.constants.R_OK, 'state/social-v2.json 读不到'],
+      [path.join(currentRoot, 'state'), fs.constants.W_OK, 'state/ 目录不可写'],
+    ];
+    for (const [file, mode, message] of checks) {
+      try { fs.accessSync(file, mode); }
+      catch { problems.push(`${message}：${file}`); }
+    }
+    return problems;
+  }
+  const ready = () => bridgeProblems().length === 0;
+  /** 真正要用桥接的地方都走这里：没配好就给出可读的错，而不是让请求变成 ENOENT。 */
+  function requireBridge() {
+    const problems = bridgeProblems();
+    if (problems.length) throw new Error(`QQ 桥接未配置好：${problems.join('；')}。请到设置页「桥接目录」里填写。`);
+    return currentRoot;
+  }
+  const bridgeJson = () => load(path.join(requireBridge(), 'config.json'));
+  {
+    const problems = bridgeProblems();
+    if (problems.length) ctx.logger?.warn?.(`fish-enhance: 桥接还没配好，功能暂时不可用 → ${problems.join('；')}`);
+  }
 
   // ── 语音聊天：从独立插件 chihaya-voice-chat 并进来 ──
   // 它原来的配置在 state/voice-chat-config.json。这一步必须放在「本插件的配置合并」之前，
   // 否则合并时会把默认值写进 persisted，再判断"有没有 voice*"就把迁移整个挡掉了。
   let migratedVoiceFromLegacy = false;
-  const legacyVoicePath = path.join(cordisConfig.bridgeRoot, 'state/voice-chat-config.json');
-  const legacyDone = path.join(cordisConfig.bridgeRoot, 'state/qzone-voice-migrated.json');
+  const legacyVoicePath = path.join(bridgeRoot(), 'state/voice-chat-config.json');
+  const legacyDone = path.join(bridgeRoot(), 'state/qzone-voice-migrated.json');
   const legacyVoice = (() => {
     try { return fs.existsSync(legacyDone) ? null : load(legacyVoicePath, null); } catch { return null; }
   })();
@@ -163,9 +204,9 @@ export function apply(ctx, rawConfig) {
   // ── 配置：cordis 默认 → 磁盘 JSON（旧字段映射）──
   const HOT_KEYS = ['publishEnabled', 'intervalHours', 'randomJitterMinutes', 'maxPerDay', 'maxChars', 'visibility', 'sourceKeys', 'adminSessionIds', 'prompt', 'proactiveEnabled', 'proactiveTargetSessions', 'proactiveIntervalMin', 'proactiveEvalEnabled', 'proactiveEvalShrink', 'proactiveChance', 'proactivePeakChance', 'proactivePeakTz', 'proactiveMissBonus', 'proactiveMissBonusMax', 'proactiveQuietStart', 'proactiveQuietEnd', 'proactiveNearMin', 'proactiveNearFactor', 'proactiveFarMin', 'proactiveFarFactor', 'proactiveCooldownMin', 'proactiveTriggerText', 'proactivePrompt', 'proactiveDryRun', 'proactiveEvalInfluence', 'proactiveMissFloorStreak', 'proactiveMissFloor', 'proactiveChanceCap',
     'voiceEnabled', 'voiceDryRun', 'voiceMode', 'voiceChance', 'voiceTargetSessions', 'voiceApiBase', 'voiceApiKey', 'voiceModelId', 'voiceVoiceId', 'voiceLanguageCode', 'voiceInstructions', 'voiceStyleProfile', 'voiceStylePresets', 'voiceMaxChars', 'voiceSpeed', 'voiceGuidanceScale', 'voiceUseSpeakerBoost', 'voiceKeepFiles'];
-  const persisted = load(configPath, {});
+  const persisted = load(bridgeFile('state/qzone-diary-config.json'), {});
   const config = {
-    bridgeRoot: cordisConfig.bridgeRoot,
+    bridgeRoot: currentRoot,
     ...Object.fromEntries(HOT_KEYS.map(k => [k, persisted[k] ?? cordisConfig[k] ?? Config({})[k]])),
   };
   if (legacyVoice && typeof legacyVoice === 'object') {
@@ -194,24 +235,27 @@ export function apply(ctx, rawConfig) {
       migratedVoiceFromLegacy = true;
     } catch { migratedVoiceFromLegacy = false; }
   }
-  const saveConfig = () => save(configPath, Object.fromEntries(HOT_KEYS.map(k => [k, config[k]])));
+  const statePath = () => bridgeFile('state/qzone-diary.json');
+  const _savePayload = () => ({ bridgeRoot: currentRoot, ...Object.fromEntries(HOT_KEYS.map(k => [k, config[k]])) });
+  // 没配好或目录不可写时静默跳过：桥接不在，配置没地方落，不该拖垮插件加载。
+  const saveConfig = () => { try { if (ready()) save(bridgeFile('state/qzone-diary-config.json'), _savePayload()); } catch { /* 落盘失败不影响运行 */ } };
   // 兼容已保存的旧独立模式，统一回到正常的概率接管。
   if (config.voiceMode === 'self') config.voiceMode = 'auto';
   saveConfig();
 
   const initialState = { drafts: [], posts: [], lastAttemptAt: null, nextAttemptAt: null, lastError: null, pending: null };
-  let state = load(statePath, initialState);
+  let state = (() => { try { return ready() ? load(statePath(), initialState) : { ...initialState }; } catch { return { ...initialState }; } })();
   // 迁移旧 state（旧版本有 scheduleNext/activityLast 等字段）
   if (!Number.isFinite(state.lastAttemptAt)) state.lastAttemptAt = null;
   if (!Number.isFinite(state.nextAttemptAt)) state.nextAttemptAt = null;
   delete state.scheduleNext; delete state.activityLast; delete state.nextAt; delete state.scheduleHash;
 
   // ── 主动回复状态 ──
-  const proactiveStatePath = path.join(cordisConfig.bridgeRoot, 'state/qzone-proactive.json');
+  const proactiveStatePath = () => bridgeFile('state/qzone-proactive.json');
   const proactiveInitial = { lastEval: null, lastProactiveAt: null, nextProactiveAt: null, lastError: null, log: [], evaluatedSessions: {} };
-  let proactiveState = load(proactiveStatePath, proactiveInitial);
+  let proactiveState = (() => { try { return ready() ? load(proactiveStatePath(), proactiveInitial) : { ...proactiveInitial }; } catch { return { ...proactiveInitial }; } })();
   if (!Array.isArray(proactiveState.log)) proactiveState.log = [];
-  const persistProactive = () => save(proactiveStatePath, proactiveState);
+  const persistProactive = () => { try { if (ready()) save(proactiveStatePath(), proactiveState); } catch { /* 落不了盘不影响运行 */ } };
   const logProactive = (text) => {
     proactiveState.log.push({ at: Date.now(), text: String(text) });
     if (proactiveState.log.length > 60) proactiveState.log = proactiveState.log.slice(-60);
@@ -223,15 +267,17 @@ export function apply(ctx, rawConfig) {
     if (!Array.isArray(state.posts) || !Array.isArray(state.drafts)) throw new Error('日记状态格式错误。');
   };
   validateState();
-  const lockPath = statePath + '.lock';
+  const lockPath = () => statePath() + '.lock';
   function acquire() {
-    try { fs.mkdirSync(lockPath, { mode: 0o700 }); }
+    const lp = lockPath();
+    if (!lp || !ready()) return () => {};
+    try { fs.mkdirSync(lp, { mode: 0o700 }); }
     catch (error) { if (error.code === 'EEXIST') throw new Error('另一个日记任务持有状态锁；若进程异常退出，请核实后移除锁目录。'); throw error; }
-    return () => fs.rmdirSync(lockPath);
+    return () => { try { fs.rmdirSync(lp); } catch { /* 已不存在就算了 */ } };
   }
   function authorize(exec) {
-    const bridge = load(bridgePath);
-    const sessions = load(path.join(cordisConfig.bridgeRoot, 'state/sessions.json'), { sessions: {} });
+    const bridge = bridgeJson();
+    const sessions = load(path.join(requireBridge(), 'state/sessions.json'), { sessions: {} });
     const ownerSession = sessions.sessions?.[`private:${bridge.ownerQQ}`];
     const id = exec.agent?.id;
     if (!id || (id !== ownerSession && !config.adminSessionIds.includes(id))) throw new Error('此工具仅允许 QQ 管理员私聊及配置授权的管理会话使用。');
@@ -241,8 +287,11 @@ export function apply(ctx, rawConfig) {
   let proactiveMissStreak = 0; // 连着几次没掷中（先声明，status() 会读）
   const abort = new AbortController();
   let active = Promise.resolve();
-  const persist = () => save(statePath, state);
+  const persist = () => { try { if (ready()) save(statePath(), state); } catch { /* 落不了盘不影响运行 */ } };
   const status = () => ({
+    bridgeRoot: currentRoot,
+    bridgeProblems: bridgeProblems(),
+    bridgeReady: ready(),
     config: Object.fromEntries(HOT_KEYS.map(k => [k, config[k]])),
     defaults: Object.fromEntries(HOT_KEYS.map(k => [k, cordisConfig[k] ?? Config({})[k]])),
     lastAttemptAt: state.lastAttemptAt ? new Date(state.lastAttemptAt).toISOString() : null,
@@ -280,9 +329,9 @@ export function apply(ctx, rawConfig) {
 
   // 生成：返回 { score, text }，LLM 输出 JSON
   async function generate(signal, topic = '') {
-    const bridge = load(bridgePath);
+    const bridge = bridgeJson();
     const since = Number.isFinite(state.lastAttemptAt) ? state.lastAttemptAt : 0;
-    const source = collectNewSource(config, bridge, load(sourcePath), Date.now(), since);
+    const source = collectNewSource(config, bridge, load(bridgeFile('state/social-v2.json')), Date.now(), since);
     if (!source.length) throw new Error('自上次以来没有新话题，跳过。');
     const selection = ctx.agentDefaultModel.currentSelection();
     const call = await ctx.llm.prepareCall({ provider: selection.provider, model: selection.model, maxTokens: 800 }, signal);
@@ -326,8 +375,8 @@ export function apply(ctx, rawConfig) {
     const now = Date.now();
     if (state.posts.some(p => p.draftId === draft.id || p.hash === digest(draft.content))) throw new Error('该条已发布。');
     if (state.posts.filter(p => p.day === dayKey(now)).length >= config.maxPerDay) throw new Error('今日发布额度已用完。');
-    const bridge = load(bridgePath);
-    const saved = load(sourcePath);
+    const bridge = bridgeJson();
+    const saved = load(bridgeFile('state/social-v2.json'));
     if (saved.paused === true) throw new Error('QQ 桥接已暂停，禁止发布。');
     checkText(draft.content, bridge, draft.content.length);
     if (![1, 4, 64].includes(draft.visibility)) throw new Error('草稿缺少有效可见范围。');
@@ -358,7 +407,7 @@ export function apply(ctx, rawConfig) {
     const release = acquire();
     busy = true;
     const task = Promise.resolve().then(() => {
-      state = load(statePath, initialState);
+      state = load(statePath(), initialState);
       validateState();
       return operation();
     });
@@ -384,7 +433,7 @@ export function apply(ctx, rawConfig) {
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('参数必须是对象。');
       authorize(exec);
       const action = args.action ?? 'status';
-      if (action === 'status') { state = load(statePath, initialState); validateState(); return status(); }
+      if (action === 'status') { if (bridgeRoot()) state = load(statePath(), initialState); validateState(); return status(); }
       if (!['post', 'preview', 'publish', 'reconcile'].includes(action)) throw new Error('无效 action。');
       const signal = AbortSignal.any([exec.signal, abort.signal, AbortSignal.timeout(90000)]);
       return exclusive(async () => {
@@ -392,7 +441,7 @@ export function apply(ctx, rawConfig) {
           // 机器人收到指令主动发：内容由机器人自己写，只受每日上限和发布闸约束，不受间隔限制
           const text = typeof args.text === 'string' ? args.text.trim() : '';
           if (!text) throw new Error('请提供要发的说说正文（text）。');
-          const bridge = load(bridgePath);
+          const bridge = bridgeJson();
           const content = checkText(text, bridge, config.maxChars);
           const vis = [1, 4, 64].includes(args.visibility) ? args.visibility : config.visibility;
           const draft = { id: randomUUID(), content, score: 1, sourceHash: digest(['manual', text]), createdAt: Date.now(), visibility: vis };
@@ -439,6 +488,9 @@ export function apply(ctx, rawConfig) {
     req.on('data', (c) => { raw += c; if (raw.length > 1e6) req.destroy(); });
     req.on('end', () => { try { resolve(JSON.parse(raw || '{}')); } catch { resolve({}); } });
   });
+  /** 密钥只走「写入」一个方向：读配置时一律打码，前端靠 hasKey 判断有没有存过。 */
+  const maskKey = (v) => (String(v || '').trim() ? '***' : '');
+  const publicConfig = () => ({ ...Object.fromEntries(HOT_KEYS.map(k => [k, config[k]])), voiceApiKey: maskKey(config.voiceApiKey) });
   const applyConfigPatch = (patch) => {
     const beforeInterval = config.intervalHours;
     const beforeJitter = config.randomJitterMinutes;
@@ -447,14 +499,25 @@ export function apply(ctx, rawConfig) {
     const beforeEvalEnabled = config.proactiveEvalEnabled;
     const beforeEvalShrink = config.proactiveEvalShrink;
     for (const k of HOT_KEYS) {
-      if (patch[k] !== undefined) config[k] = patch[k];
+      if (patch[k] === undefined) continue;
+      // 打码回来的 '***' 表示「前端没改动」，不要拿它盖掉真密钥
+      if (k === 'voiceApiKey' && (patch[k] === '***' || String(patch[k]).trim() === '')) continue;
+      config[k] = patch[k];
+    }
+    if (patch.bridgeRoot !== undefined) {
+      const next = bridgeRootOf(patch.bridgeRoot);
+      if (String(patch.bridgeRoot || '').trim() && !next) throw new Error('桥接目录必须是绝对路径，例如 /opt/qq-bridge。');
+      if (next !== currentRoot) {
+        currentRoot = next;
+        config.bridgeRoot = next;
+      }
     }
     saveConfig();
     if (config.intervalHours !== beforeInterval || config.randomJitterMinutes !== beforeJitter) {
       // 间隔变了：重算下次尝试时间
       const release = acquire();
       try {
-        state = load(statePath, initialState);
+        state = load(statePath(), initialState);
         validateState();
         state.nextAttemptAt = nextAttempt(config, state.lastAttemptAt ?? Date.now(), Date.now());
         persist();
@@ -475,7 +538,7 @@ export function apply(ctx, rawConfig) {
         const url = new URL(req.url, 'http://127.0.0.1');
         const p = url.pathname;
         if (req.method === 'GET' && p === '/api/qzone-diary/status') return sendJson(res, 200, { ok: true, ...status() });
-        if (req.method === 'GET' && p === '/api/qzone-diary/config') return sendJson(res, 200, { ok: true, config: Object.fromEntries(HOT_KEYS.map(k => [k, config[k]])), defaults: Object.fromEntries(HOT_KEYS.map(k => [k, cordisConfig[k] ?? Config({})[k]])) });
+        if (req.method === 'GET' && p === '/api/qzone-diary/config') return sendJson(res, 200, { ok: true, config: publicConfig(), defaults: Object.fromEntries(HOT_KEYS.map(k => [k, cordisConfig[k] ?? Config({})[k]])) });
         if (req.method === 'GET' && p === '/api/qzone-diary/proactive-sessions') {
           return sendJson(res, 200, { ok: true, sessions: listProactiveSessions() });
         }
@@ -483,7 +546,7 @@ export function apply(ctx, rawConfig) {
           const patch = await readBody(req);
           if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return sendJson(res, 400, { ok: false, error: '参数必须是对象。' });
           applyConfigPatch(patch);
-          return sendJson(res, 200, { ok: true, config: Object.fromEntries(HOT_KEYS.map(k => [k, config[k]])) });
+          return sendJson(res, 200, { ok: true, config: publicConfig() });
         }
         if (req.method === 'POST' && p === '/api/qzone-diary/post') {
           const body = await readBody(req);
@@ -491,7 +554,7 @@ export function apply(ctx, rawConfig) {
           if (!text) return sendJson(res, 400, { ok: false, error: '请提供 text。' });
           const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(30000)]);
           const r = await exclusive(async () => {
-            const bridge = load(bridgePath);
+            const bridge = bridgeJson();
             const content = checkText(text, bridge, config.maxChars);
             const vis = [1, 4, 64].includes(body.visibility) ? body.visibility : config.visibility;
             const draft = { id: randomUUID(), content, score: 1, sourceHash: digest(['manual', text]), createdAt: Date.now(), visibility: vis };
@@ -545,7 +608,7 @@ export function apply(ctx, rawConfig) {
         // ── 语音聊天 ──
         if (req.method === 'GET' && p === '/api/qzone-diary/voice/status') return sendJson(res, 200, { ok: true, ...voiceStatus() });
         if (req.method === 'GET' && p === '/api/qzone-diary/voice/sessions') return sendJson(res, 200, { ok: true, sessions: listVoiceSessions() });
-        if (req.method === 'GET' && p === '/api/qzone-diary/voice/key') return sendJson(res, 200, { ok: true, key: config.voiceApiKey || '' });
+        if (req.method === 'GET' && p === '/api/qzone-diary/voice/key') return sendJson(res, 200, { ok: true, key: maskKey(config.voiceApiKey), hasKey: Boolean(String(config.voiceApiKey || '').trim()) });
         if (req.method === 'GET' && p === '/api/qzone-diary/voice/voices') {
           const r = await describeVoices();
           return sendJson(res, 200, { ok: r.ok, ...r });
@@ -582,7 +645,7 @@ export function apply(ctx, rawConfig) {
   {
     const release = acquire();
     try {
-      state = load(statePath, initialState);
+      state = load(statePath(), initialState);
       validateState();
       if (!Number.isFinite(state.nextAttemptAt)) state.nextAttemptAt = nextAttempt(config, state.lastAttemptAt ?? Date.now(), Date.now());
       persist();
@@ -629,10 +692,10 @@ export function apply(ctx, rawConfig) {
   // 从独立插件 chihaya-voice-chat 并入；配置字段一律以 voice 开头。
   // ══════════════════════════════════════════════════════════════
   const VOICE_HISTORY_LIMIT = 40;
-  const voiceStatePath = path.join(cordisConfig.bridgeRoot, 'state/qzone-voice.json');
-  let voiceState = load(voiceStatePath, { log: [], lastError: null });
+  const voiceStatePath = () => bridgeFile('state/qzone-voice.json');
+  let voiceState = (() => { try { return ready() ? load(voiceStatePath(), { log: [], lastError: null }) : { log: [], lastError: null }; } catch { return { log: [], lastError: null }; } })();
   if (!Array.isArray(voiceState.log)) voiceState.log = [];
-  const persistVoice = () => save(voiceStatePath, voiceState);
+  const persistVoice = () => { try { if (ready()) save(voiceStatePath(), voiceState); } catch { /* 落不了盘不影响运行 */ } };
   const vlog = (text) => {
     voiceState.log.push({ at: Date.now(), text: String(text).slice(0, 400) });
     if (voiceState.log.length > VOICE_HISTORY_LIMIT) voiceState.log = voiceState.log.slice(-VOICE_HISTORY_LIMIT);
@@ -640,25 +703,25 @@ export function apply(ctx, rawConfig) {
     try { ctx.logger.info(`voice-chat: ${String(text)}`); } catch {}
   };
 
-  const voiceBridgeConfig = () => load(bridgePath);
+  const voiceBridgeConfig = () => (ready() ? load(path.join(currentRoot, 'config.json')) : {});
   const voiceDir = () => {
     const b = voiceBridgeConfig() || {};
     const dir = String(b.socialV2?.voice?.dir || 'audio');
-    return path.isAbsolute(dir) ? dir : path.join(cordisConfig.bridgeRoot, dir);
+    return path.isAbsolute(dir) ? dir : path.join(bridgeRoot() || '.', dir);
   };
   const voiceConsoleUrl = () => `http://127.0.0.1:${Number((voiceBridgeConfig() || {}).consolePort) || 3100}`;
   const voiceConsoleToken = () => {
-    try { return fs.readFileSync(path.join(cordisConfig.bridgeRoot, 'state/console-token'), 'utf8').trim(); }
+    try { return fs.readFileSync(path.join(requireBridge(), 'state/console-token'), 'utf8').trim(); }
     catch { return ''; }
   };
   /** DSH 会话 id ↔ QQ 会话 key 的对应表（桥接维护）。 */
-  const voiceSessionMap = () => load(path.join(cordisConfig.bridgeRoot, 'state/sessions.json'), { sessions: {} }).sessions ?? {};
+  const voiceSessionMap = () => (ready() ? (load(path.join(currentRoot, 'state/sessions.json'), { sessions: {} }).sessions ?? {}) : {});
   const keyForSession = (sid) => {
     const plain = sessionKey(sid);
     for (const [key, val] of Object.entries(voiceSessionMap())) if (sessionKey(val) === plain) return key;
     return '';
   };
-  const agentTokenFor = (key) => String((load(sourcePath, {}) || {}).conversations?.[key]?.agentToken || '');
+  const agentTokenFor = (key) => String((load(bridgeFile('state/social-v2.json'), {}) || {}).conversations?.[key]?.agentToken || '');
   const voiceUsable = () => Boolean(config.voiceEnabled)
     && Boolean(String(config.voiceApiKey || '').trim())
     && Boolean(String(config.voiceVoiceId || '').trim());

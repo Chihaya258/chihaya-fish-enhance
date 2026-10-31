@@ -3,7 +3,7 @@
   "version": "1.2.0",
   "private": true,
   "type": "module",
-  "description": "QQ 机器人加强插件：QQ 空间随笔、主动回复与语音聊天（Breeze Blue 合成语音条）。带设置页。",
+  "description": "肥鱼增强 / Fish Enhance：QQ 空间随笔、主动回复与语音聊天（Breeze Blue 合成语音条）。带设置页。",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
