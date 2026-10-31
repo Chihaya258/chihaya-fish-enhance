@@ -213,6 +213,10 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
       const [busy, setBusy] = React.useState('');
       const [activeFeature, setActiveFeature] = React.useState('qzone');
       const [proactiveSessions, setProactiveSessions] = React.useState([]);
+      const [voiceSessions, setVoiceSessions] = React.useState([]);
+      const [voiceList, setVoiceList] = React.useState(null);
+      const [speakKey, setSpeakKey] = React.useState('');
+      const [speakText, setSpeakText] = React.useState('');
 
       React.useEffect(() => {
         let alive = true;
@@ -224,6 +228,23 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
         };
         loadSessions();
         const t = setInterval(loadSessions, 15000);
+        return () => { alive = false; clearInterval(t); };
+      }, []);
+
+      React.useEffect(() => {
+        let alive = true;
+        const tick = async () => {
+          try {
+            const r = await jget('/voice/sessions');
+            if (alive && r?.ok) {
+              const list = r.sessions || [];
+              setVoiceSessions(list);
+              setSpeakKey((k) => k || (list.find((s) => s.key) || {}).key || '');
+            }
+          } catch { /* 拿不到就算了 */ }
+        };
+        tick();
+        const t = setInterval(tick, 15000);
         return () => { alive = false; clearInterval(t); };
       }, []);
 
@@ -286,6 +307,39 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
         finally { setBusy(''); }
       };
 
+      const loadVoices = async () => {
+        setBusy('voices');
+        try {
+          const r = await jget('/voice/voices');
+          setVoiceList(r);
+          say(r?.ok ? `拿到 ${(r.voices || []).length} 个音色 / ${(r.models || []).length} 个模型` : (r?.error || '没拿到清单'), r?.ok ? 'good' : 'warn');
+        } catch (e) { say(String(e?.message ?? e), 'warn'); }
+        finally { setBusy(''); }
+      };
+      const onVoicePreview = async () => {
+        const text = speakText.trim();
+        if (!text) { say('先写一句要念的话', 'warn'); return; }
+        setBusy('vpreview'); say('现场合成中…', '');
+        try {
+          const r = await jpost('/voice/preview', { text });
+          if (!r?.ok) { say(r?.error || '合成失败', 'warn'); return; }
+          say(`试听好了：${r.file}（${r.chars} 字 / ${Math.round((r.bytes || 0) / 1024)}KB / ${r.ms}ms）${r.model ? ' · ' + r.model : ''}`, 'good');
+        } catch (e) { say(String(e?.message ?? e), 'warn'); }
+        finally { setBusy(''); }
+      };
+      const onVoiceSpeak = async () => {
+        const text = speakText.trim();
+        if (!speakKey) { say('先选一个会话', 'warn'); return; }
+        if (!text) { say('先写一句要念的话', 'warn'); return; }
+        setBusy('vspeak'); say(`合成并发送到 ${speakKey}…`, '');
+        try {
+          const r = await jpost('/voice/speak', { key: speakKey, text });
+          if (!r?.ok) { say(r?.error || '发送失败', 'warn'); return; }
+          say(`已发出：${speakKey}，${r.chars} 字 / ${Math.round((r.bytes || 0) / 1024)}KB / ${r.ms}ms${r.verified ? '（已验证）' : ''}`, 'good');
+        } catch (e) { say(String(e?.message ?? e), 'warn'); }
+        finally { setBusy(''); }
+      };
+
       if (!st || !cfg) return h('div', { 'data-qzd-page': '' }, h('div', { 'data-qzd-note': '' }, '读设置中…'));
 
       return h('div', { 'data-qzd-page': '' },
@@ -293,12 +347,154 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
         h('nav', { 'data-qzd-nav': '', 'aria-label': '机器人功能' },
           h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'qzone' ? '' : undefined, onClick: () => setActiveFeature('qzone') }, 'QQ 空间'),
           h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'proactive' ? '' : undefined, onClick: () => setActiveFeature('proactive') }, '主动回复'),
+          h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'voice' ? '' : undefined, onClick: () => setActiveFeature('voice') }, '语音聊天'),
           h('button', { 'data-qzd-tab': '', 'data-active': activeFeature === 'overview' ? '' : undefined, onClick: () => setActiveFeature('overview') }, '功能总览'),
         ),
+        activeFeature === 'voice' ? h('div', { 'data-qzd-feature': '' },
+          h('div', { 'data-qzd-row': '' },
+            h('span', { 'data-qzd-badge': '' }, st.voice?.enabled ? '语音聊天已开' : '语音聊天关'),
+            h('span', { 'data-qzd-badge': '' }, `接管出口：${st.voice?.deliveryHook || '-'}`),
+            !st.voice?.hasKey ? h('span', { 'data-qzd-badge': '' }, '缺密钥') : null,
+            !st.voice?.hasVoice ? h('span', { 'data-qzd-badge': '' }, '缺音色') : null,
+            st.voice?.today ? h('span', { 'data-qzd-badge': '' }, `今天已发 ${st.voice.today} 条`) : null),
+          st.voice?.migrated ? h(Hint, null, '已从独立插件 chihaya-voice-chat 迁入原来的密钥/音色/风格设置。') : null,
+
+          h(Card, { title: '开关' },
+            h(Para, null, '机器人随时可能把一条回复说成语音：它自己想在正文里写 [[语音]] 就一定发（不受概率限制），其余情况按概率掷骰决定。'),
+            h(ToggleRow, {
+              label: '启用语音聊天',
+              note: '总闸。关着时一切照旧，只打字。',
+              on: Boolean(cfg.voiceEnabled),
+              onChange: (v) => patch({ voiceEnabled: v }, '语音聊天'),
+            }),
+            h(ToggleRow, {
+              label: '试运行',
+              note: '开着 = 掷中也不真发（默认）。建议先看几轮记录再关。',
+              on: Boolean(cfg.voiceDryRun),
+              onChange: (v) => patch({ voiceDryRun: v }, '试运行'),
+            }),
+            h(Field, { label: '发送方式', hint: '自决 = 机器人想发就发（正文带 [[语音]] 记号），不带记号就打字，概率只作参考；接管 = 掷中的那一轮直接变成语音条；补发 = 先出文字，再补一条语音。' },
+              h('select', {
+                'data-qzd-input': '', value: cfg.voiceMode || 'auto',
+                onChange: (e) => patch({ voiceMode: e.target.value }, '发送方式'),
+              },
+                h('option', { value: 'self' }, '自决：AI 想发就发'),
+                h('option', { value: 'auto' }, '接管：只发语音'),
+                h('option', { value: 'after' }, '补发：文字 + 语音'))),
+            h(Field, { label: '语音概率（全局）', hint: (cfg.voiceMode === 'self')
+              ? '自决模式下这一项只作参考：正文带 [[语音]] 的回复一律发语音，不看概率。'
+              : '0 = 从不发语音，100 = 只要轮到它就发语音。骰子按"轮"掷，同一轮内不重复掷。' },
+              h(NumInput, { value: cfg.voiceChance, min: 0, max: 100, unit: '%', onCommit: (v) => patch({ voiceChance: Number(v) }, '语音概率') }))),
+
+          h(Card, { title: '音色与密钥' },
+            h(Para, null, '走 Breeze Blue 的 text-to-speech 接口：填好密钥与音色就能用，不需要额外的语音库地址。'),
+            h(Field, { label: 'API 密钥' },
+              h('input', {
+                'data-qzd-input': '', type: 'password', placeholder: 'xi-api-key…',
+                defaultValue: '',
+                onBlur: (e) => { const v = e.target.value.trim(); if (v) patch({ voiceApiKey: v }, '密钥'); },
+              }),
+              h(Hint, null, st.voice?.hasKey ? '已保存密钥（留空表示不改）。' : '还没填。')),
+            h(Field, { label: '音色 ID', hint: '填 voice_id，例如 voc_xxx。' },
+              h('input', {
+                'data-qzd-input': '', placeholder: 'voc_…', defaultValue: cfg.voiceVoiceId || '',
+                onBlur: (e) => patch({ voiceVoiceId: e.target.value.trim() }, '音色'),
+              })),
+            h(Field, { label: '模型 ID（可留空）', hint: '留空交给服务端自动选。' },
+              h('input', {
+                'data-qzd-input': '', placeholder: '（自动）', defaultValue: cfg.voiceModelId || '',
+                onBlur: (e) => patch({ voiceModelId: e.target.value.trim() }, '模型'),
+              })),
+            h(Field, { label: '语言代码' },
+              h('input', {
+                'data-qzd-input': '', placeholder: 'zh', defaultValue: cfg.voiceLanguageCode || '',
+                onBlur: (e) => patch({ voiceLanguageCode: e.target.value.trim() }, '语言'),
+              })),
+            h('div', { 'data-qzd-row': '' },
+              h('button', { 'data-qzd-btn': '', disabled: busy === 'voices', onClick: loadVoices }, busy === 'voices' ? '拉取中…' : '拉取音色/模型清单'),
+              voiceList?.ok ? h('span', { 'data-qzd-note': '' }, `${(voiceList.voices || []).length} 个音色 · ${(voiceList.models || []).length} 个模型`) : null,
+              voiceList && !voiceList.ok && voiceList.error ? h(Warn, null, voiceList.error) : null),
+            voiceList?.ok && (voiceList.voices || []).length
+              ? h(Field, { label: '从清单里挑一个音色', hint: '选中即写入上面的音色 ID。' },
+                h('select', {
+                  'data-qzd-input': '', value: cfg.voiceVoiceId || '',
+                  onChange: (e) => patch({ voiceVoiceId: e.target.value }, '音色'),
+                },
+                  h('option', { value: '' }, '（不选）'),
+                  ...(voiceList.voices || []).map((v) => h('option', { key: v.id, value: v.id }, `${v.name}（${v.id}）`))))
+              : null),
+
+          h(Card, { title: '说话风格（交给 Breeze 的表演指令）' },
+            h(Para, null, '音色 ID 决定"谁在说"，这里决定"怎么说"。写人话、写成给配音演员的提示：语气、语速、情绪、句子长度。'),
+            h(Field, { label: '基础指令', hint: '每一条都会带上。留空则只用语色自带设定。' },
+              h('textarea', {
+                'data-qzd-input': '', rows: 4, placeholder: '例如：用标准普通话，语气自然亲近，像跟熟人说话…',
+                defaultValue: cfg.voiceInstructions || '',
+                onBlur: (e) => patch({ voiceInstructions: e.target.value }, '基础指令'),
+              })),
+            h(Field, { label: '风格补充', hint: '叠加在基础指令之后，平时可以随手改。' },
+              h('textarea', {
+                'data-qzd-input': '', rows: 3, placeholder: '例如：句子短一点，句尾软一点…',
+                defaultValue: cfg.voiceStyleProfile || '',
+                onBlur: (e) => patch({ voiceStyleProfile: e.target.value }, '风格补充'),
+              })),
+            h(NumRow, {
+              label: '字数上限', note: '超过这个字数这条就不走语音（不截断）。', min: 20, max: 1000,
+              value: cfg.voiceMaxChars, onCommit: (v) => patch({ voiceMaxChars: Number(v) }, '字数上限'),
+            }),
+            h(NumRow, {
+              label: '语速', note: '0.5 ~ 2.0，1 是正常。', min: 0.5, max: 2,
+              value: cfg.voiceSpeed, onCommit: (v) => patch({ voiceSpeed: Number(v) }, '语速'),
+            }),
+            h(NumRow, {
+              label: '表现力（guidance）', note: '1 ~ 10，越高越"放得开"。', min: 1, max: 10,
+              value: cfg.voiceGuidanceScale, onCommit: (v) => patch({ voiceGuidanceScale: Number(v) }, '表现力'),
+            }),
+            h(ToggleRow, {
+              label: '音色增强',
+              note: '打开后音质更饱满，速度略慢一点。',
+              on: Boolean(cfg.voiceUseSpeakerBoost),
+              onChange: (v) => patch({ voiceUseSpeakerBoost: v }, '音色增强'),
+            })),
+
+          h(Card, { title: '生效范围' },
+            h(Para, null, '只在勾选的会话里发语音。一个都不勾 = 所有绑定了 QQ 的会话。'),
+            h(SessionPicker, {
+              sessions: voiceSessions.length ? voiceSessions : proactiveSessions,
+              selected: cfg.voiceTargetSessions || [],
+              onChange: (ids) => patch({ voiceTargetSessions: ids }, '目标会话'),
+            }),
+            voiceSessions.length ? h('div', { 'data-qzd-note': '' },
+              '已绑定 QQ 的会话：' + voiceSessions.map((s) => `${s.title}（${s.key}）`).join('、')) : null),
+
+          h(Card, { title: '试听 / 手动发一条' },
+            h(Field, { label: '要念的话' },
+              h('textarea', {
+                'data-qzd-input': '', rows: 3, placeholder: '喂，在干嘛呀？',
+                value: speakText, onChange: (e) => setSpeakText(e.target.value),
+              })),
+            h(Field, { label: '发到哪个会话' },
+              h('select', {
+                'data-qzd-input': '', value: speakKey, onChange: (e) => setSpeakKey(e.target.value),
+              },
+                h('option', { value: '' }, '（选一个）'),
+                ...(voiceSessions.length ? voiceSessions : proactiveSessions)
+                  .filter((s) => s.key || s.id)
+                  .map((s) => h('option', { key: s.id, value: s.key || s.id }, `${s.title}（${s.key || s.id}）`)))),
+            h('div', { 'data-qzd-row': '' },
+              h('button', { 'data-qzd-btn': '', disabled: busy === 'vpreview', onClick: onVoicePreview }, busy === 'vpreview' ? '合成中…' : '只合成（不发送）'),
+              h('button', { 'data-qzd-btn': '', 'data-primary': '', disabled: busy === 'vspeak', onClick: onVoiceSpeak }, busy === 'vspeak' ? '发送中…' : '合成并发出去')),
+            h(Hint, null, '试运行开着时，"发出去"不会真发；要真发请先关掉试运行。')),
+
+          (st.voice?.lastError || (st.voice?.log || []).length) ? h(Card, { title: '最近记录' },
+            st.voice?.lastError ? h(Warn, null, `最近一次失败：${st.voice.lastError.message}`) : null,
+            ...(st.voice?.log || []).slice().reverse().map((l, i) => h('div', { 'data-qzd-note': '', key: i },
+              `${new Date(l.at).toLocaleTimeString('zh-CN', { hour12: false })} · ${l.text}`))) : null,
+        ) : null,
         activeFeature === 'overview' ? h('div', { 'data-qzd-feature': '' },
           h('div', { 'data-qzd-card': '' },
             h('div', { 'data-qzd-card-title': '' }, 'QQ 机器人加强插件'),
-            h('div', { 'data-qzd-note': '' }, '这里将集中管理机器人的扩展功能。当前已接入 QQ 空间与主动回复，后续可继续添加消息、群管理、定时任务等功能。'),
+            h('div', { 'data-qzd-note': '' }, '这里将集中管理机器人的扩展功能。当前已接入 QQ 空间、主动回复与语音聊天，后续可继续添加消息、群管理、定时任务等功能。'),
           ),
           h('div', { 'data-qzd-card': '' },
             h('div', { 'data-qzd-card-title': '' }, '当前功能'),
@@ -306,6 +502,8 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
             h('div', { 'data-qzd-note': '' }, '从机器人近期发言整理随笔草稿，并按计划和概率发布。'),
             h('div', { 'data-qzd-label': '' }, '主动回复'),
             h('div', { 'data-qzd-note': '' }, '到点主动搭话，并用大模型给「现在该不该开口」打个分，据此动态调整间隔与命中线。'),
+            h('div', { 'data-qzd-label': '' }, '语音聊天'),
+            h('div', { 'data-qzd-note': '' }, '按概率把某一轮的回复现场合成语音发出去（Breeze Blue），风格可自定义。'),
           ),
         ) : null,
         activeFeature === 'proactive' ? h('div', { 'data-qzd-feature': '' },

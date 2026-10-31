@@ -3,6 +3,8 @@ import path from 'node:path';
 import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import z from '@deepseek-ai/schemastery';
+import { createUserMessage } from '@deepseek-ai/dsh-llm';
+import { requestSpeech, cleanForSpeech, describeError, MAX_TEXT_CHARS, DEFAULT_BASE } from './tts.js';
 
 export const inject = ['tools', 'llm', 'agentDefaultModel', 'webServer', 'agents', 'sessions', 'sessionTitle', 'workspaceRegistry'];
 
@@ -42,7 +44,61 @@ export const Config = z.object({
   proactiveTriggerText: z.string().max(500).default('对方刚说的话告一段落，你现在想主动接一句。基于刚才的对话自然回应，别突兀、别重复、别没话找话。').description('触发文案（将作为「你自己的念头」送进会话）'),
   proactivePrompt: z.string().max(2000).default('').description('主动回复风格补充（追加在触发文案后）'),
   proactiveDryRun: z.boolean().default(true).description('主动回复试运行：只记账不真发'),
+  // —— 语音聊天（Breeze Blue 现场合成 → QQ 语音条）——
+  voiceEnabled: z.boolean().default(false).description('语音聊天总开关：关着就永远只发字'),
+  voiceDryRun: z.boolean().default(true).description('语音试运行：掷中只合成记账、不真发（先看几轮再关）'),
+  voiceMode: z.union([z.const('auto'), z.const('self'), z.const('after')]).default('auto')
+    .description('怎么发语音：auto=掷中的那一轮，这条回复直接变成语音条（替掉文字）；self=AI 想发就发，正文带 [[语音]] 记号就连语音，不带就打字（概率只做参考）；after=先正常打字，再补一条语音（会多出一条）'),
+  voiceChance: z.number().step(1).min(0).max(100).default(30).description('全局语音概率（%）：每次轮到自己说话，有这么大的机会改用语音'),
+  voiceTargetSessions: z.array(z.string()).default([]).description('对哪些 DSH 会话发语音；空 = 所有绑定了 QQ 的会话'),
+  voiceApiBase: z.string().max(300).default(DEFAULT_BASE).description('Breeze Blue API 地址（填到 /v1 为止）'),
+  voiceApiKey: z.string().max(300).default('').description('Breeze Blue 密钥（xi-api-key）'),
+  voiceModelId: z.string().max(160).default('').description('模型 id，留空 = 自动（Breeze 按语言自己挑）'),
+  voiceVoiceId: z.string().max(160).default('').description('音色 ID（voice_id）'),
+  voiceLanguageCode: z.string().max(10).default('zh').description('语言代码，中文填 zh；留空交给模型'),
+  voiceInstructions: z.string().max(2000).default('').description('默认表演指令（Breeze 的 instructions）：音色本身的说话方式'),
+  voiceStyleProfile: z.string().max(4000).default('').description('说话风格：一段话描述该怎么说话、什么情绪、什么节奏，会并入每次合成的表演指令'),
+  voiceStylePresets: z.array(z.string()).default([]).description('自己攒的说话风格候选（页面上一点就填进「说话风格」）'),
+  voiceMaxChars: z.number().step(1).min(20).max(MAX_TEXT_CHARS).default(400).description('每条语音最多读多少字，超了就不发语音（不截断）'),
+  voiceSpeed: z.number().min(0.5).max(2).default(1).description('语速（0.5～2.0）'),
+  voiceGuidanceScale: z.number().min(1).max(10).default(2).description('指令遵循强度（1～10，越高越贴着指令念）'),
+  voiceUseSpeakerBoost: z.boolean().default(true).description('增强音色相似度'),
+  voiceKeepFiles: z.number().step(1).min(1).max(500).default(50).description('语音库保留最近多少个本插件生成的文件（qc-*.wav）'),
 });
+
+/** 从模型回复里找出「这条要发语音」的记号，并摘掉记号。 */
+export function extractSpeakMarker(text) {
+  const s = String(text ?? '');
+  // 模型常把记号写成全角括号、半角括号或【】，语气分隔符也常写错，这里都认
+  const re = /[\[【［]\s*[\[【［]?\s*(?:语音|聲音|声音|voice|speak|speech)\s*(?:[·•・:：\-—]\s*([^\]】］\n]{0,40}))?\s*[\]】］]\s*[\]】］]?/i;
+  const m = re.exec(s);
+  if (!m) return { speak: false, hint: '', text: s.trim() };
+  const hint = String(m[1] ?? '').trim();
+  const rest = s.replace(re, '').replace(/[ \t]+\n/g, '\n').replace(/[ \t]{2,}/g, ' ').trim();
+  return { speak: true, hint, text: rest };
+}
+
+/** 交给 Breeze 的表演指令：默认指令 + 说话风格 + 这一条的临时风格。 */
+export function composeInstructions(config, hint) {
+  const parts = [];
+  const base = String(config.voiceInstructions || '').trim();
+  const style = String(config.voiceStyleProfile || '').trim();
+  if (base) parts.push(base);
+  if (style) parts.push(`【说话风格】${style}`);
+  const h = String(hint || '').trim();
+  if (h) parts.push(`【这一条】${h}`);
+  return parts.join('\n');
+}
+
+/** 掷骰：这次轮到说话了，要不要改用语音。 */
+export function rollVoice(config, random = Math.random) {
+  if (!config.voiceEnabled) return { speak: false, reason: '语音总开关是关的' };
+  if (!String(config.voiceApiKey || '').trim()) return { speak: false, reason: '没有填 Breeze 密钥' };
+  if (!String(config.voiceVoiceId || '').trim()) return { speak: false, reason: '没有填音色 ID' };
+  const chance = Math.max(0, Math.min(100, Number(config.voiceChance) || 0));
+  const roll = random() * 100;
+  return { speak: roll < chance, roll, chance };
+}
 
 export function dayKey(time) {
   return new Date(time + 8 * 3600000).toISOString().slice(0, 10);
@@ -106,13 +162,50 @@ export function apply(ctx, rawConfig) {
   fs.accessSync(sourcePath, fs.constants.R_OK);
   fs.accessSync(path.dirname(statePath), fs.constants.W_OK);
 
+  // ── 语音聊天：从独立插件 chihaya-voice-chat 并进来 ──
+  // 它原来的配置在 state/voice-chat-config.json。这一步必须放在「本插件的配置合并」之前，
+  // 否则合并时会把默认值写进 persisted，再判断"有没有 voice*"就把迁移整个挡掉了。
+  let migratedVoiceFromLegacy = false;
+  const legacyVoicePath = path.join(cordisConfig.bridgeRoot, 'state/voice-chat-config.json');
+  const legacyDone = path.join(cordisConfig.bridgeRoot, 'state/qzone-voice-migrated.json');
+  const legacyVoice = (() => {
+    try { return fs.existsSync(legacyDone) ? null : load(legacyVoicePath, null); } catch { return null; }
+  })();
+
   // ── 配置：cordis 默认 → 磁盘 JSON（旧字段映射）──
-  const HOT_KEYS = ['publishEnabled', 'intervalHours', 'randomJitterMinutes', 'maxPerDay', 'maxChars', 'visibility', 'sourceKeys', 'adminSessionIds', 'prompt', 'proactiveEnabled', 'proactiveTargetSessions', 'proactiveIntervalMin', 'proactiveEvalEnabled', 'proactiveEvalShrink', 'proactiveChance', 'proactivePeakChance', 'proactivePeakTz', 'proactiveMissBonus', 'proactiveMissBonusMax', 'proactiveQuietStart', 'proactiveQuietEnd', 'proactiveNearMin', 'proactiveNearFactor', 'proactiveFarMin', 'proactiveFarFactor', 'proactiveCooldownMin', 'proactiveTriggerText', 'proactivePrompt', 'proactiveDryRun', 'proactiveEvalInfluence', 'proactiveMissFloorStreak', 'proactiveMissFloor', 'proactiveChanceCap'];
+  const HOT_KEYS = ['publishEnabled', 'intervalHours', 'randomJitterMinutes', 'maxPerDay', 'maxChars', 'visibility', 'sourceKeys', 'adminSessionIds', 'prompt', 'proactiveEnabled', 'proactiveTargetSessions', 'proactiveIntervalMin', 'proactiveEvalEnabled', 'proactiveEvalShrink', 'proactiveChance', 'proactivePeakChance', 'proactivePeakTz', 'proactiveMissBonus', 'proactiveMissBonusMax', 'proactiveQuietStart', 'proactiveQuietEnd', 'proactiveNearMin', 'proactiveNearFactor', 'proactiveFarMin', 'proactiveFarFactor', 'proactiveCooldownMin', 'proactiveTriggerText', 'proactivePrompt', 'proactiveDryRun', 'proactiveEvalInfluence', 'proactiveMissFloorStreak', 'proactiveMissFloor', 'proactiveChanceCap',
+    'voiceEnabled', 'voiceDryRun', 'voiceMode', 'voiceChance', 'voiceTargetSessions', 'voiceApiBase', 'voiceApiKey', 'voiceModelId', 'voiceVoiceId', 'voiceLanguageCode', 'voiceInstructions', 'voiceStyleProfile', 'voiceStylePresets', 'voiceMaxChars', 'voiceSpeed', 'voiceGuidanceScale', 'voiceUseSpeakerBoost', 'voiceKeepFiles'];
   const persisted = load(configPath, {});
   const config = {
     bridgeRoot: cordisConfig.bridgeRoot,
     ...Object.fromEntries(HOT_KEYS.map(k => [k, persisted[k] ?? cordisConfig[k] ?? Config({})[k]])),
   };
+  if (legacyVoice && typeof legacyVoice === 'object') {
+    const pair = {
+      voiceEnabled: 'voiceEnabled', voiceDryRun: 'dryRun', voiceMode: 'voiceMode', voiceChance: 'voiceChance',
+      voiceTargetSessions: 'targetSessions', voiceApiBase: 'apiBase', voiceApiKey: 'apiKey',
+      voiceModelId: 'modelId', voiceVoiceId: 'voiceId', voiceLanguageCode: 'languageCode',
+      voiceInstructions: 'instructions', voiceStyleProfile: 'styleProfile', voiceStylePresets: 'stylePresets',
+      voiceMaxChars: 'maxChars', voiceSpeed: 'speed', voiceGuidanceScale: 'guidanceScale',
+      voiceUseSpeakerBoost: 'useSpeakerBoost', voiceKeepFiles: 'keepFiles',
+    };
+    for (const [target, source] of Object.entries(pair)) {
+      // 新页面上已经存过的值优先，没存过才搬旧的
+      if (legacyVoice[source] !== undefined && persisted[target] === undefined) {
+        persisted[target] = legacyVoice[source];
+        config[target] = legacyVoice[source];
+      }
+    }
+    // customModelId 是旧页面的「自定义模型名」，有值就以它为准
+    const custom = String(legacyVoice.customModelId || '').trim();
+    if (custom && persisted.voiceModelId === undefined) { persisted.voiceModelId = custom; config.voiceModelId = custom; }
+    // 写个标记文件（只是时间戳，不含密钥），下次启动不再搬
+    try {
+      fs.mkdirSync(path.dirname(legacyDone), { recursive: true });
+      fs.writeFileSync(legacyDone, JSON.stringify({ at: Date.now(), from: legacyVoicePath }));
+      migratedVoiceFromLegacy = true;
+    } catch { migratedVoiceFromLegacy = false; }
+  }
   const saveConfig = () => save(configPath, Object.fromEntries(HOT_KEYS.map(k => [k, config[k]])));
   saveConfig();
 
@@ -192,6 +285,7 @@ export function apply(ctx, rawConfig) {
       recentEvents: (proactiveState.eventDiag || []).slice(-15),
       log: (proactiveState.log || []).slice(-10),
     },
+    voice: voiceStatus(),
   });
 
   // 生成：返回 { score, text }，LLM 输出 JSON
@@ -458,6 +552,35 @@ export function apply(ctx, rawConfig) {
           });
           return sendJson(res, 200, { ok: true, ...r });
         }
+        // ── 语音聊天 ──
+        if (req.method === 'GET' && p === '/api/qzone-diary/voice/status') return sendJson(res, 200, { ok: true, ...voiceStatus() });
+        if (req.method === 'GET' && p === '/api/qzone-diary/voice/sessions') return sendJson(res, 200, { ok: true, sessions: listVoiceSessions() });
+        if (req.method === 'GET' && p === '/api/qzone-diary/voice/key') return sendJson(res, 200, { ok: true, key: config.voiceApiKey || '' });
+        if (req.method === 'GET' && p === '/api/qzone-diary/voice/voices') {
+          const r = await describeVoices();
+          return sendJson(res, 200, { ok: r.ok, ...r });
+        }
+        if (req.method === 'POST' && p === '/api/qzone-diary/voice/preview') {
+          const body = await readBody(req);
+          const text = typeof body.text === 'string' ? body.text.trim() : '';
+          if (!text) return sendJson(res, 400, { ok: false, error: '请提供 text。' });
+          const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(120000)]);
+          const r = await speakOnce('preview:', text, '试听（不发送）', typeof body.hint === 'string' ? body.hint : '', signal, true);
+          return sendJson(res, 200, { ok: r.ok, ...r, error: r.error ? String(r.error) : undefined });
+        }
+        if (req.method === 'POST' && p === '/api/qzone-diary/voice/speak') {
+          const body = await readBody(req);
+          const key = typeof body.key === 'string' ? body.key.trim() : '';
+          const text = typeof body.text === 'string' ? body.text.trim() : '';
+          if (!key || !text) return sendJson(res, 400, { ok: false, error: '请提供 key 和 text。' });
+          const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(150000)]);
+          const r = await speakOnce(key, text, '手动试发', typeof body.hint === 'string' ? body.hint : '', signal);
+          return sendJson(res, 200, { ok: r.ok, ...r, error: r.error ? String(r.error) : undefined });
+        }
+        if (req.method === 'POST' && p === '/api/qzone-diary/voice/test') {
+          const r = await describeVoices();
+          return sendJson(res, 200, { ok: r.ok, voiceUsable: voiceUsable(), dir: (() => { try { return voiceDir(); } catch { return ''; } })(), ...r });
+        }
         return sendJson(res, 404, { ok: false, error: `unknown ${req.method} ${p}` });
       } catch (e) {
         sendJson(res, 500, { ok: false, error: e?.message ?? String(e) });
@@ -510,6 +633,372 @@ export function apply(ctx, rawConfig) {
     }).catch(() => {});
   }, 30000);
   interval?.unref();
+
+  // ══════════════════════════════════════════════════════════════
+  // 语音聊天（Breeze Blue 现场合成 → QQ 语音条）
+  // 从独立插件 chihaya-voice-chat 并入；配置字段一律以 voice 开头。
+  // ══════════════════════════════════════════════════════════════
+  const VOICE_HISTORY_LIMIT = 40;
+  const voiceStatePath = path.join(cordisConfig.bridgeRoot, 'state/qzone-voice.json');
+  let voiceState = load(voiceStatePath, { log: [], lastError: null });
+  if (!Array.isArray(voiceState.log)) voiceState.log = [];
+  const persistVoice = () => save(voiceStatePath, voiceState);
+  const vlog = (text) => {
+    voiceState.log.push({ at: Date.now(), text: String(text).slice(0, 400) });
+    if (voiceState.log.length > VOICE_HISTORY_LIMIT) voiceState.log = voiceState.log.slice(-VOICE_HISTORY_LIMIT);
+    persistVoice();
+    try { ctx.logger.info(`voice-chat: ${String(text)}`); } catch {}
+  };
+
+  const voiceBridgeConfig = () => load(bridgePath);
+  const voiceDir = () => {
+    const b = voiceBridgeConfig() || {};
+    const dir = String(b.socialV2?.voice?.dir || 'audio');
+    return path.isAbsolute(dir) ? dir : path.join(cordisConfig.bridgeRoot, dir);
+  };
+  const voiceConsoleUrl = () => `http://127.0.0.1:${Number((voiceBridgeConfig() || {}).consolePort) || 3100}`;
+  const voiceConsoleToken = () => {
+    try { return fs.readFileSync(path.join(cordisConfig.bridgeRoot, 'state/console-token'), 'utf8').trim(); }
+    catch { return ''; }
+  };
+  /** DSH 会话 id ↔ QQ 会话 key 的对应表（桥接维护）。 */
+  const voiceSessionMap = () => load(path.join(cordisConfig.bridgeRoot, 'state/sessions.json'), { sessions: {} }).sessions ?? {};
+  const keyForSession = (sid) => {
+    const plain = sessionKey(sid);
+    for (const [key, val] of Object.entries(voiceSessionMap())) if (sessionKey(val) === plain) return key;
+    return '';
+  };
+  const agentTokenFor = (key) => String((load(sourcePath, {}) || {}).conversations?.[key]?.agentToken || '');
+  const voiceUsable = () => Boolean(config.voiceEnabled)
+    && Boolean(String(config.voiceApiKey || '').trim())
+    && Boolean(String(config.voiceVoiceId || '').trim());
+  function voiceTarget(sid) {
+    const list = (config.voiceTargetSessions || []).map(sessionKey);
+    if (list.length) return list.includes(sessionKey(sid));
+    return Boolean(keyForSession(sid));
+  }
+
+  const VOICE_ERR_HINT = {
+    '语音功能已关闭': '去桥接 config.json 把 socialV2.voice.enabled 改成 true',
+    '工具未启用': '去桥接控制台打开 qq_send_voice（socialV2.tools.sendVoice）',
+    '静默模式已开启': '当前是静默模式，管理员私聊之外不发语音',
+    'agent token 无效': '会话 token 过期了，去桥接控制台重新生成',
+    '目标不在当前模式允许范围内': '这个会话不在桥接白名单里',
+    '该接口仅 reserved2 模式可用': '桥接不是在 reserved2 模式下跑',
+    '发送过于频繁': '桥接的语音限流（每分钟/每小时上限）',
+  };
+  const explainVoice = (msg) => {
+    const s = String(msg || '');
+    for (const [needle, hint] of Object.entries(VOICE_ERR_HINT)) if (s.includes(needle)) return `${s}（${hint}）`;
+    return s;
+  };
+
+  function pruneVoices(dir) {
+    try {
+      const keep = Math.max(1, Number(config.voiceKeepFiles) || 50);
+      const files = fs.readdirSync(dir)
+        .filter(f => f.startsWith('qc-') && f.endsWith('.wav'))
+        .map(f => ({ f, t: fs.statSync(path.join(dir, f)).mtimeMs }))
+        .sort((a, b) => b.t - a.t);
+      for (const { f } of files.slice(keep)) { try { fs.unlinkSync(path.join(dir, f)); } catch {} }
+    } catch { /* 清理失败不影响发送 */ }
+  }
+
+  async function synthesizeVoice(text, signal, hint) {
+    const speak = cleanForSpeech(text);
+    if (!speak) throw new Error('洗完之后没剩下能念的字。');
+    const limit = Math.min(Number(config.voiceMaxChars) || MAX_TEXT_CHARS, MAX_TEXT_CHARS);
+    const chars = [...speak].length;
+    if (chars > limit) throw new Error(`这条要读的话有 ${chars} 字，超过上限 ${limit} 字，这条不用语音（不截断）。`);
+    const r = await requestSpeech({
+      apiBase: config.voiceApiBase,
+      apiKey: config.voiceApiKey,
+      modelId: String(config.voiceModelId || '').trim(),
+      voiceId: config.voiceVoiceId,
+      languageCode: config.voiceLanguageCode,
+      instructions: composeInstructions(config, hint),
+      speed: config.voiceSpeed,
+      guidanceScale: config.voiceGuidanceScale,
+      useSpeakerBoost: config.voiceUseSpeakerBoost,
+    }, speak, signal);
+    const dir = voiceDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const name = `qc-${new Date().toISOString().replace(/[-:T.Z]/g, '').slice(0, 14)}-${randomUUID().slice(0, 8)}.wav`;
+    fs.writeFileSync(path.join(dir, name), r.buffer);
+    pruneVoices(dir);
+    return { name, bytes: r.bytes, chars: r.chars, model: r.model };
+  }
+
+  async function sendVoice(key, voiceName, signal) {
+    const token = agentTokenFor(key);
+    if (!token) throw new Error(`${key} 还没有会话 token（这个会话可能还没建立）。`);
+    const headers = { 'content-type': 'application/json' };
+    const ct = voiceConsoleToken();
+    if (ct) headers['x-console-token'] = ct;
+    headers['x-agent-token'] = token;
+    const timeout = signal ? AbortSignal.any([signal, AbortSignal.timeout(120000)]) : AbortSignal.timeout(120000);
+    const resp = await fetch(`${voiceConsoleUrl()}/api/socialV2/send-voice`, {
+      method: 'POST', headers, body: JSON.stringify({ key, token, voice: voiceName, verify: true }), signal: timeout,
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok || body.ok !== true) throw new Error(explainVoice(body.error || body.message || `HTTP ${resp.status}`));
+    return body;
+  }
+
+  /** 发一条语音；所有分支都记账到 voiceState.log，方便在设置页排查。onlySynth = 只合成不发送。 */
+  async function speakOnce(key, text, reason, hint, signal, onlySynth = false) {
+    const t0 = Date.now();
+    const record = { at: t0, key, text: String(text).slice(0, 120), chars: [...String(text)].length };
+    const sig = signal ? AbortSignal.any([abort.signal, signal]) : abort.signal;
+    try {
+      const r = await synthesizeVoice(text, sig, hint);
+      record.file = r.name; record.bytes = r.bytes; record.model = r.model;
+      if (onlySynth) {
+        record.ms = Date.now() - t0;
+        vlog(`试听已合成（${record.chars} 字 / ${Math.round(r.bytes / 1024)}KB，${record.ms}ms，${r.model}）：${r.name}`);
+        return { ok: true, ...record };
+      }
+      if (config.voiceDryRun) {
+        record.ms = Date.now() - t0;
+        record.dryRun = true;
+        vlog(`试运行：合成好了没发（${key}，${record.chars} 字 / ${Math.round(r.bytes / 1024)}KB，${record.ms}ms，${r.model}）${reason ? '｜' + reason : ''}`);
+        return { ok: true, ...record };
+      }
+      const sent = await sendVoice(key, r.name, sig);
+      record.messageId = sent.messageId ?? null;
+      record.verified = sent.verified ?? null;
+      record.ms = Date.now() - t0;
+      if (voiceState.lastError && voiceState.lastError.what === 'voice') voiceState.lastError = null;
+      vlog(`语音已发（${key}，${record.chars} 字 / ${Math.round(r.bytes / 1024)}KB，${record.ms}ms，${r.model}）${reason ? '｜' + reason : ''}`);
+      return { ok: true, ...record };
+    } catch (e) {
+      const msg = String((e && e.message) || e).slice(0, 300);
+      record.error = msg; record.ms = Date.now() - t0;
+      voiceState.lastError = { at: Date.now(), what: 'voice', message: msg };
+      vlog(`语音失败（${key}）：${msg}`);
+      return { ok: false, ...record };
+    }
+  }
+
+  const turnVoice = new Map();     // 会话 id → 本轮掷中的结果 { turn, speak, hint }
+  const INTERNAL_SOURCE = /^(plugin:|bili-|user-approval|runtime-context|system)/;
+  const internalTurns = new Set();
+
+  function planVoiceTurn(sid, turn) {
+    const cached = turnVoice.get(sid);
+    if (cached && cached.turn === turn) return cached;
+    if (!voiceUsable()) return null;
+    const hit = rollVoice(config);
+    if (!hit.speak) {
+      if (typeof hit.roll === 'number' && hit.reason === undefined) vlog(`掷 ${hit.roll.toFixed(0)} ≥ ${hit.chance}% → 打字`);
+      turnVoice.set(sid, { turn, speak: false });
+      return turnVoice.get(sid);
+    }
+    turnVoice.set(sid, { hint: '', turn, speak: true, source: 'auto' });
+    vlog(`掷 ${hit.roll.toFixed(0)} < ${hit.chance}% → 这一轮用语音`);
+    return turnVoice.get(sid);
+  }
+
+  /** 这条要念的话能不能当语音发：能不能洗出字、字数够不够短（超了就不发，不截断）。 */
+  function voiceReady(text) {
+    const speak = cleanForSpeech(text);
+    if (!speak) return { ok: false, why: '洗完没剩下能念的字' };
+    const limit = Math.min(Number(config.voiceMaxChars) || MAX_TEXT_CHARS, MAX_TEXT_CHARS);
+    const chars = [...speak].length;
+    if (chars > limit) return { ok: false, why: `这条有 ${chars} 字，超过语音上限 ${limit} 字` };
+    return { ok: true, text: speak };
+  }
+
+  // QQ reserved2 模式下真正发话走的是工具调用，不是 assistant 文本块 → 在发送出口接管
+  const VOICE_SEND_TOOLS = new Set(['qq_send_message', 'qq_send_burst', 'qq_reply', 'qq_send_group_message', 'qq_send_private_message']);
+  const toolSuccess = value => {
+    const content = [{ type: 'text', text: JSON.stringify(value) }];
+    return { isError: false, value: { content }, content };
+  };
+  const toolFailure = message => ({ isError: true, error: { message }, content: [{ type: 'text', text: message }] });
+  async function outgoingVoice(exec, next) {
+    const name = String(exec.name || '').split('__').pop();
+    if (!VOICE_SEND_TOOLS.has(name) || !voiceUsable() || disposed) return next();
+    const sid = String(exec.agent?.id || '');
+    if (!sid || !voiceTarget(sid)) return next();
+    const args = exec.arguments || {};
+    const key = String(args.key || (args.groupId ? `group:${args.groupId}` : args.userId ? `private:${args.userId}` : ''));
+    if (!key || key !== keyForSession(sid)) return next();
+    let raw = args.messages ?? args.message;
+    if (typeof raw === 'string' && /^[\["]/.test(raw.trim())) {
+      try { const parsed = JSON.parse(raw); if (typeof parsed === 'string' || Array.isArray(parsed)) raw = parsed; } catch {}
+    }
+    const text = (Array.isArray(raw) ? raw.map(String).join('\n') : String(raw ?? '')).trim();
+    if (!text) return next();
+    // ① AI 自己写的 [[语音]] 记号：只要总闸开着就发，完全不受概率限制
+    let parsed = extractSpeakMarker(text);
+    let byChoice = true;
+    // ② 没写记号：只有 voiceMode=auto 时，才轮到本轮的掷骰结果决定
+    if (!parsed.speak) {
+      byChoice = false;
+      if (config.voiceMode === 'self') return next();
+      const plan = turnVoice.get(sid) ?? planVoiceTurn(sid, `send:${exec.rootCallId || exec.callId}`);
+      if (!plan?.speak) return next();
+      parsed = { speak: true, hint: parsed.hint || '', text };
+    }
+    const ready = voiceReady(parsed.text);
+    if (!ready.ok) {
+      vlog(`发送出口：${ready.why} → ${byChoice ? '这条发文字（显式要语音但内容不适合）' : '保留文字'}`);
+      return next();
+    }
+    if (config.voiceDryRun) {
+      vlog(`试运行：QQ发送工具命中语音（${byChoice ? 'AI 自决' : '概率'}），不合成不改动文字（${key}）`);
+      return next();
+    }
+    if (exec.signal?.aborted) return toolFailure('语音发送已取消。');
+    // 补发模式只用于概率命中；AI 显式要语音时仍然只发语音条，不再重复发一遍文字
+    if (!byChoice && config.voiceMode === 'after') {
+      const original = await next();
+      if (original.isError) return original;
+      await speakOnce(key, ready.text, '发送工具补发', parsed.hint || '', exec.signal);
+      return original;
+    }
+    const reason = byChoice ? 'AI自决:[[语音]]' : `发送工具:${name}`;
+    vlog(`发送出口已接管 ${name}（${key}，${[...ready.text].length}字，${byChoice ? 'AI 自决' : '概率命中'}），正在现场合成`);
+    const sent = await speakOnce(key, ready.text, reason, parsed.hint || '', exec.signal);
+    if (!sent.ok) return toolFailure(`现场合成或发送失败：${sent.error}。未发送文字，也未报告成功。`);
+    return toolSuccess({ ok: true, key, sent: 1, failed: 0, delivery: 'voice', byChoice, messageId: sent.messageId, verified: sent.verified, file: sent.file });
+  }
+
+  // 提示注入：走 agent/pre-step（可持久化的普通 user 消息，不 append 新的 session 事件类型）
+  const VOICE_STYLE_RULES = '话要短、要顺口、像平时说话，别念 markdown、链接、编号、代码或任何符号表情；分点罗列的内容改写成一两句话。';
+  const voiceTip = () => `【语音聊天】你仍照常调用 QQ 发消息工具（qq_send_message 等），插件会在发送出口将正文现场合成为语音，不必自己合成、找音频文件。这一轮轮到你说的话会以语音条发出去，用户听到的是声音，所以${VOICE_STYLE_RULES}`;
+  const voiceSelfTip = () => `【语音聊天】这一轮你可以自己决定用不用语音：想用语音说话时，照常调用 QQ 发消息工具，并在正文里写上 [[语音]]（也可以写 [[语音·这一条的语气]] 指定语气，比如 [[语音·压低声音]]）。带上这个记号就一定发语音，不受发送概率限制——真的想让她听到你的声音（撒娇、哄人、语气比字更能表达的时候）就用它。不想用语音就别写记号，正常打字。用语音时${VOICE_STYLE_RULES}`;
+  const voicePreStep = async ({ agent, turn, signal }, next) => {
+    const decision = await next();
+    if (decision.kind === 'reject' || signal?.aborted) return decision;
+    try {
+      const sid = String(agent?.id ?? '');
+      if (!sid || !voiceTarget(sid)) return decision;
+      if (config.voiceMode === 'self') {
+        if (internalTurns.has(sid)) { turnVoice.delete(sid); return decision; }
+        return {
+          ...decision,
+          messages: [...decision.messages, createUserMessage({
+            content: [{ type: 'text', text: voiceSelfTip() }],
+            source: { kind: 'voice-chat', form: 'notice', summary: '想用语音说话就写 [[语音]]' },
+          })],
+        };
+      }
+      if (config.voiceMode !== 'auto') return decision;
+      if (internalTurns.has(sid)) { turnVoice.delete(sid); return decision; }
+      if (!planVoiceTurn(sid, turn)?.speak) return decision;
+      return {
+        ...decision,
+        messages: [...decision.messages, createUserMessage({
+          content: [{ type: 'text', text: voiceTip() }],
+          source: { kind: 'voice-chat', form: 'notice', summary: '这一轮说的话会变成语音' },
+        })],
+      };
+    } catch { return decision; }
+  };
+
+  // 语音聊天的事件钩子（订阅在 ctx.effect 里统一注册，见本段末尾）
+  const voiceEventHandler = (session, event) => {
+    try {
+      if (disposed || !event || typeof event.type !== 'string') return;
+      const sid = String(session?.id ?? '');
+      if (!sid || !voiceTarget(sid)) return;
+      if (event.type === 'user/message') {
+        const kind = String(event.data?.source?.kind ?? event.data?.message?.source?.kind ?? '');
+        if (INTERNAL_SOURCE.test(kind)) internalTurns.add(sid);
+      } else if (event.type === 'turn/end') {
+        turnVoice.delete(sid);
+        internalTurns.delete(sid);
+      }
+    } catch { /* 事件处理不能炸 */ }
+  };
+
+  /** 拿音色/模型清单（GET /v1/voices、/v1/models），填设置时不用来回切控制台。 */
+  async function describeVoices() {
+    const key = String(config.voiceApiKey || '').trim();
+    if (!key) return { ok: false, error: '还没填密钥。', voices: [], models: [] };
+    const base = String(config.voiceApiBase || DEFAULT_BASE).replace(/\/+$/, '');
+    const grab = async (p) => {
+      const resp = await fetch(`${base}${p}`, { headers: { 'xi-api-key': key }, signal: AbortSignal.timeout(15000) });
+      if (!resp.ok) throw new Error(`${p} → HTTP ${resp.status}：${describeError(await resp.text().catch(() => ''))}`);
+      return resp.json();
+    };
+    try {
+      const [v, m] = await Promise.allSettled([grab('/voices'), grab('/models')]);
+      const voices = v.status === 'fulfilled' ? normalizeVoices(v.value) : [];
+      const models = m.status === 'fulfilled' ? normalizeModels(m.value) : [];
+      const error = v.status === 'rejected' ? String(v.reason?.message || v.reason)
+        : (m.status === 'rejected' ? String(m.reason?.message || m.reason) : '');
+      return { ok: voices.length > 0 || models.length > 0, voices, models, error };
+    } catch (e) {
+      return { ok: false, error: String(e?.message || e), voices: [], models: [] };
+    }
+  }
+  const normalizeVoices = (payload) => {
+    const arr = Array.isArray(payload) ? payload : (payload?.voices ?? payload?.data ?? []);
+    return (Array.isArray(arr) ? arr : []).map(v => ({
+      id: String(v?.voice_id ?? v?.id ?? ''),
+      name: String(v?.name ?? v?.display_name ?? v?.voice_id ?? ''),
+      preview: String(v?.preview_url ?? ''),
+    })).filter(v => v.id);
+  };
+  const normalizeModels = (payload) => {
+    const arr = Array.isArray(payload) ? payload : (payload?.models ?? payload?.data ?? []);
+    return (Array.isArray(arr) ? arr : []).map(m => ({
+      id: String(m?.model_id ?? m?.id ?? ''),
+      name: String(m?.name ?? m?.model_id ?? m?.id ?? ''),
+      languages: Array.isArray(m?.languages) ? m.languages.map(String) : [],
+    })).filter(m => m.id);
+  };
+
+  /** 列出「绑定了 QQ 的会话」：来自桥接的 sessions.json，加上当前开着的 agent。 */
+  function listVoiceSessions() {
+    const map = voiceSessionMap();
+    const out = [];
+    const seen = new Set();
+    const add = (key, sid) => {
+      const id = String(sid || '').trim();
+      if (!id || seen.has(sessionKey(id))) return;
+      seen.add(sessionKey(id));
+      const agent = findAgent(id);
+      out.push({
+        id,
+        key,
+        title: sessionTitleOf(id) || key || id,
+        alive: agent !== undefined,
+        status: agent === undefined ? '没活着' : String(agent.status ?? '?'),
+        checked: (config.voiceTargetSessions || []).some(s => sessionKey(s) === sessionKey(id)),
+      });
+    };
+    for (const [key, sid] of Object.entries(map)) add(key, sid);
+    try { for (const a of ctx.agents.list?.() ?? []) add(keyForSession(a?.id), a?.id); } catch {}
+    return out;
+  }
+
+  const voiceStatus = () => ({
+    enabled: Boolean(config.voiceEnabled),
+    dryRun: Boolean(config.voiceDryRun),
+    mode: config.voiceMode,
+    chance: config.voiceChance,
+    hasKey: Boolean(String(config.voiceApiKey || '').trim()),
+    hasVoice: Boolean(String(config.voiceVoiceId || '').trim()),
+    voiceId: config.voiceVoiceId,
+    targets: config.voiceTargetSessions || [],
+    bridgeRoot: config.bridgeRoot,
+    voiceDir: (() => { try { return voiceDir(); } catch { return ''; } })(),
+    lastFile: (voiceState.log || []).slice().reverse().map(l => /：([^\s：]+\.wav)$/.exec(l.text)).find(Boolean)?.[1] ?? '',
+    consoleUrl: (() => { try { return voiceConsoleUrl(); } catch { return ''; } })(),
+    migrated: migratedVoiceFromLegacy,
+    deliveryHook: 'qq-tools-v3',
+    lastError: voiceState.lastError,
+    log: (voiceState.log || []).slice(-15),
+    today: (voiceState.log || []).filter(l => dayKey(l.at) === dayKey(Date.now()) && /语音已发/.test(l.text)).length,
+  });
+
+  ctx.effect(() => ctx.on('tools/execute', outgoingVoice), 'voice-chat: QQ发送工具出口转换');
+  ctx.effect(() => ctx.on('agent/pre-step', voicePreStep), 'voice-chat: 语音提示注入');
+  ctx.effect(() => ctx.on('session/event', voiceEventHandler), 'voice-chat: 轮次与内部轮标记');
 
   // ══════════════════════════════════════════════════════════════
   // 主动回复（参考 dsh-speak-up，叠加 LLM 动态评估间隔）

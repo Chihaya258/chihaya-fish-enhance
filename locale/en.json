@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "QQ Bot Enhancement",
-    "description": "Extensible QQ bot plugin, currently including QQ Space diary posting; publishing is disabled by default and friends-only."
+    "description": "Extensible QQ bot plugin: QQ Space diary, proactive replies, and voice chat (Breeze Blue synthesized voice messages); publishing is disabled by default and friends-only."
   }
 }

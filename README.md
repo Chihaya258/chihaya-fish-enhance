@@ -1,6 +1,12 @@
 # chihaya-fish-enhance（QQ 机器人加强插件）
 
-面向 QQ 机器人的可扩展加强插件。目前已包含「QQ 空间随笔」功能：让机器人从自己的近期发言里，自动整理一两句草稿；启用发布后，按「值得发送程度」的概率掷骰决定发不发。Web 设置页已按功能拆分，后续可继续添加更多机器人能力。
+面向 QQ 机器人的可扩展加强插件。目前包含三块功能：
+
+- **QQ 空间随笔**：从自己的近期发言里自动整理一两句草稿，启用发布后按「值得发送程度」的概率掷骰决定发不发。
+- **主动回复**：到点主动搭话，并用大模型给「现在该不该开口」打个分，据此动态调整间隔与命中线。
+- **语音聊天**：AI 自己决定什么时候用语音说话（正文写 `[[语音]]` 就一定发，不受限），也可按全局概率掷骰接管某一轮；现场合成为语音条发出去（Breeze Blue），声音风格可自定义。
+
+Web 设置页按功能分区，后续可继续添加更多机器人能力。
 
 > 仅供上传/分发准备用的源码快照，不含 `node_modules`。
 
@@ -62,6 +68,30 @@ qzone-diary/
 | `adminSessionIds` | string[] | `[]` | 额外允许管理日记的 DSH 会话 ID |
 | `prompt` | string | `''` | 随笔风格补充（≤2000 字） |
 
+### 语音聊天
+
+| 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `voiceEnabled` | boolean | `false` | 语音总闸 |
+| `voiceDryRun` | boolean | `true` | 试运行：掷中也只记账不真发 |
+| `voiceMode` | `self`\|`auto`\|`after` | `auto` | `self`=AI 想发就发（正文带 `[[语音]]` 必发，不看概率）；`auto`=掷中的那一轮只发语音；`after`=文字 + 补发语音 |
+| `voiceChance` | number | `30` | 全局语音概率（0–100，按轮掷骰）；`self` 模式下只作参考 |
+| `voiceTargetSessions` | string[] | `[]` | 生效会话；空=所有绑定了 QQ 的会话 |
+| `voiceApiBase` | string | `https://api.breeze.blue/v1` | Breeze Blue 接口根 |
+| `voiceApiKey` | string | `''` | `xi-api-key` |
+| `voiceVoiceId` | string | `''` | 音色 ID（`voc_…`） |
+| `voiceModelId` | string | `''` | 模型 ID，空=服务端自动 |
+| `voiceLanguageCode` | string | `zh` | 语言代码 |
+| `voiceInstructions` | string | `''` | 表演指令（每一条都带） |
+| `voiceStyleProfile` | string | `''` | 风格补充（叠加在指令之后） |
+| `voiceMaxChars` | number | `400` | 超过就不走语音（**不截断**） |
+| `voiceSpeed` / `voiceGuidanceScale` / `voiceUseSpeakerBoost` | | `1` / `2` / `true` | 语速、表现力、音色增强 |
+| `voiceKeepFiles` | number | `50` | 语音库只留最近多少条 |
+
+语音链路：`agent/pre-step` 掷骰并注入提示 → 模型照常调用 QQ 发消息工具 → 插件的 `tools/execute` 出口把正文合成成 wav，落 `audio/qc-*.wav`，再由桥接 `POST /api/socialV2/send-voice` 发成语音条。合成失败一律返回 `isError`，不会谎报成功，也不会偷偷退回成文字。
+
+**AI 自主发语音**：模型在正文里写 `[[语音]]`（也认 `【语音】`、`[[语音·压低声音]]`、`[[语音：带着睡意]]`）就是明确要说话——这条一定发语音，**不受概率限制**，`self`/`auto`/`after` 三种发送方式下都成立（`after` 下也只发语音，不再重复发文字）。记号本身会被摘掉，不会念出来；正文超过 `voiceMaxChars` 时退回文字。`self` 模式下每轮会注入一段提示，告诉模型它随时可以用这个记号。
+
 ---
 
 ## 配置与状态落盘
@@ -75,13 +105,16 @@ qzone-diary/
 | `state/sessions.json` | 会话映射，用于鉴权（只读） |
 | `state/qzone-diary.json` | 日记状态：草稿、已发布、下次尝试时间、pending |
 | `state/qzone-diary-config.json` | 热配置（设置页改动的持久化，旧字段自动映射） |
+| `state/qzone-voice.json` | 语音聊天的发送记录与最近错误 |
+| `state/voice-chat-config.json` | 旧独立插件 `chihaya-voice-chat` 的配置（首次启动按 `voice*` 字段搬一次，可删） |
+| `audio/qc-*.wav` | 合成出来的语音（只留 `voiceKeepFiles` 条） |
 
 ---
 
 ## 鉴权
 
 - 仅允许 **QQ 管理员私聊**（`private:<ownerQQ>`）及 `adminSessionIds` 里配置的管理会话调用模型工具 `qzone_diary`。
-- HTTP 设置页 API 走 `/api/qzone-diary/*`，由宿主 webServer 提供。
+- HTTP 设置页 API 走 `/api/qzone-diary/*`，由宿主 webServer 提供；语音相关在 `/api/qzone-diary/voice/{status,sessions,key,voices,config,preview,speak,test}`。
 
 ---
 
@@ -127,7 +160,15 @@ systemctl restart dsh-web
 
 ---
 
+## 测试
+
+```bash
+npm test   # tts.test.js（Breeze 请求体/清洗/掷骰）+ outgoing.test.js（发送出口接管）
+```
+
+发送出口的用例用一个假 ctx 跑 `apply()`，不出网、不碰真实桥接。
+
 ## 版本
 
-- 当前 `package.json` 版本：`1.1.0`
+- 当前 `package.json` 版本：`1.2.0`
 - 包名：`chihaya-fish-enhance`（`private: true`）

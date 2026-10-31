@@ -32,3 +32,21 @@
         proactiveTriggerText: '对方刚说的话告一段落，你现在想主动接一句。基于刚才的对话自然回应，别突兀、别重复、别没话找话。'
         proactivePrompt: ''
         proactiveDryRun: true
+        voiceEnabled: false
+        voiceDryRun: true
+        voiceMode: auto
+        voiceChance: 30
+        voiceTargetSessions: []
+        voiceApiBase: https://api.breeze.blue/v1
+        voiceApiKey: ''
+        voiceModelId: ''
+        voiceVoiceId: ''
+        voiceLanguageCode: zh
+        voiceInstructions: ''
+        voiceStyleProfile: ''
+        voiceStylePresets: []
+        voiceMaxChars: 400
+        voiceSpeed: 1
+        voiceGuidanceScale: 2
+        voiceUseSpeakerBoost: true
+        voiceKeepFiles: 50
