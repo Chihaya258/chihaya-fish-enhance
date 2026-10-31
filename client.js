@@ -360,7 +360,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
           st.voice?.migrated ? h(Hint, null, '已从独立插件 chihaya-voice-chat 迁入原来的密钥/音色/风格设置。') : null,
 
           h(Card, { title: '开关' },
-            h(Para, null, '机器人随时可能把一条回复说成语音：它自己想在正文里写 [[语音]] 就一定发（不受概率限制），其余情况按概率掷骰决定。'),
+            h(Para, null, '每轮轮到机器人说话时掷一次骰子，掷中就按下面的「发送方式」把这一条说成语音，没掷中就照常打字。'),
             h(ToggleRow, {
               label: '启用语音聊天',
               note: '总闸。关着时一切照旧，只打字。',
@@ -373,17 +373,14 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
               on: Boolean(cfg.voiceDryRun),
               onChange: (v) => patch({ voiceDryRun: v }, '试运行'),
             }),
-            h(Field, { label: '发送方式', hint: '自决 = 机器人想发就发（正文带 [[语音]] 记号），不带记号就打字，概率只作参考；接管 = 掷中的那一轮直接变成语音条；补发 = 先出文字，再补一条语音。' },
+            h(Field, { label: '发送方式', hint: '接管 = 掷中时只发语音；补发 = 掷中时先文字再补一条语音。' },
               h('select', {
                 'data-qzd-input': '', value: cfg.voiceMode || 'auto',
                 onChange: (e) => patch({ voiceMode: e.target.value }, '发送方式'),
               },
-                h('option', { value: 'self' }, '自决：AI 想发就发'),
                 h('option', { value: 'auto' }, '接管：只发语音'),
                 h('option', { value: 'after' }, '补发：文字 + 语音'))),
-            h(Field, { label: '语音概率（全局）', hint: (cfg.voiceMode === 'self')
-              ? '自决模式下这一项只作参考：正文带 [[语音]] 的回复一律发语音，不看概率。'
-              : '0 = 从不发语音，100 = 只要轮到它就发语音。骰子按"轮"掷，同一轮内不重复掷。' },
+            h(Field, { label: '语音概率（全局）', hint: '0 = 一直打字，100 = 每轮都改用语音。同一轮只掷一次，概率改动后下一轮即生效。' },
               h(NumInput, { value: cfg.voiceChance, min: 0, max: 100, unit: '%', onCommit: (v) => patch({ voiceChance: Number(v) }, '语音概率') }))),
 
           h(Card, { title: '音色与密钥' },

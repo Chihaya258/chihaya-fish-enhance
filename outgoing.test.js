@@ -1,11 +1,17 @@
 // 发送出口（tools/execute → 语音条）的行为测试：不出网、不碰真实桥接。
 // 用一个最小的 ctx 假件把 index.js 的 apply() 跑起来，只验证「接管哪些调用」，
 // 以及合成失败时绝不谎报成功。
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { Readable } from 'node:stream';
+
+const realFetch = globalThis.fetch;
+let requests = [];
+globalThis.fetch = async (...args) => { requests.push(args); throw new Error('mock synthesis failure'); };
+after(() => { globalThis.fetch = realFetch; });
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qzd-voice-'));
 fs.mkdirSync(path.join(root, 'state'), { recursive: true });
@@ -15,12 +21,13 @@ fs.writeFileSync(path.join(root, 'state', 'console-token'), 'ct');
 fs.writeFileSync(path.join(root, 'state', 'social-v2.json'), JSON.stringify({ conversations: { 'private:1': { agentToken: 'tok-a' } } }));
 
 const handlers = new Map();
+const definitions = new Map();
 const ctx = {
   logger: { info() {}, warn() {}, error() {} },
   effect(fn) { const d = fn(); return () => (typeof d === 'function' ? d() : undefined); },
   on(name, fn) { handlers.set(name, [...(handlers.get(name) ?? []), fn]); return () => { const l = handlers.get(name) ?? []; handlers.set(name, l.filter(f => f !== fn)); }; },
-  webServer: { register() {} },
-  tools: { register() {}, execute: async () => ({}) },
+  webServer: { register(route) { this.route = route; } },
+  tools: { register(def) { definitions.set(def.name, def); return () => definitions.delete(def.name); }, execute: async () => ({}) },
   agents: { get() {}, list: () => [], inject() {} },
   sessions: { get() {} },
   sessionTitle: { of: () => '' },
@@ -30,8 +37,9 @@ const ctx = {
 
 const mod = await import('./index.js');
 
-/** 换个发送方式来测；chance 用来验证「AI 自决」不受概率影响。 */
+/** 换个发送方式/概率来测。 */
 const applyAs = (mode, chance) => {
+  fs.rmSync(path.join(root, 'state', 'qzone-diary-config.json'), { force: true });
   mod.apply(ctx, {
     bridgeRoot: root, voiceEnabled: true, voiceDryRun: false, voiceMode: mode, voiceChance: chance,
     voiceApiKey: 'bad-key', voiceVoiceId: 'voc_test', voiceTargetSessions: ['session-a'],
@@ -81,36 +89,105 @@ test('空正文：原样放行', async () => {
   assert.equal(was(), true);
 });
 
-// —— AI 自决：正文带 [[语音]] 就一定发，跟概率、发送方式都无关 ——
-const withMarker = (mode, chance) => applyAs(mode, chance);
-
-test('self 模式：没记号 → 打字', async () => {
-  const runSelf = withMarker('self', 100);
+test('概率 0 无记号：仍按概率放行文字', async () => {
+  const runIt = applyAs('auto', 0);
   const [next, was] = passed();
-  // 按住随机数，确保「概率 100% 掷中」这条路径也被走过（self 模式下它必须被忽略）
-  const realRandom = Math.random;
-  Math.random = () => 0;
+  await runIt({ name: 'qq_send_message', agent: { id: 'session-a' }, arguments: { key: 'private:1', message: '在的' } }, next);
+  assert.equal(was(), true);
+});
+
+test('概率 100 无记号：仍接管合成', async () => {
+  const runIt = applyAs('auto', 100);
+  const [next, was] = passed();
+  const r = await runIt({ name: 'qq_send_message', agent: { id: 'session-a' }, arguments: { key: 'private:1', message: '在的' } }, next);
+  assert.equal(was(), false);
+  assert.equal(r.isError, true);
+});
+
+test('总开关关闭：不提示语音且不绕过总闸', async () => {
+  applyAs('auto', 0);
+  fs.rmSync(path.join(root, 'state', 'qzone-diary-config.json'), { force: true });
+  mod.apply(ctx, { bridgeRoot: root, voiceEnabled: false, voiceApiKey: 'bad-key', voiceVoiceId: 'voc_test' });
+  const original = { kind: 'enter', messages: [] };
+  const r = await handlers.get('agent/pre-step').at(-1)({ agent: { id: 'session-a' }, turn: 6 }, async () => original);
+  assert.equal(r, original);
+  const [next, was] = passed();
+  await handlers.get('tools/execute').at(-1)({ name: 'qq_send_message', agent: { id: 'session-a' }, arguments: { key: 'private:1', message: '在的' } }, next);
+  assert.equal(was(), true);
+});
+
+test('掷中：接管合成并发送，只发一条语音', async () => {
+  const runIt = applyAs('auto', 100);
+  const failFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    calls.push({ url: String(url), body: JSON.parse(opts.body) });
+    if (String(url).includes('/text-to-speech/')) return new Response(Buffer.from('RIFF-mock-audio'));
+    return Response.json({ ok: true, verified: true, messageId: 789 });
+  };
   try {
-    await runSelf({ name: 'qq_send_message', agent: { id: 'session-a' }, arguments: { key: 'private:1', message: '在的' } }, next);
-  } finally { Math.random = realRandom; }
-  assert.equal(was(), true, '没记号就该原样发文字，哪怕概率 100%');
-});
-
-test('概率 0 也拦不住 [[语音]]：接管并走合成（合成失败=isError，不发文字）', async () => {
-  for (const mode of ['auto', 'self', 'after']) {
-    const runIt = withMarker(mode, 0);
     const [next, was] = passed();
-    const r = await runIt({ name: 'qq_send_message', agent: { id: 'session-a' }, arguments: { key: 'private:1', message: '[[语音]] 我来了' } }, next);
-    assert.equal(was(), false, `${mode}：带记号不能放行成文字`);
-    assert.equal(r.isError, true, `${mode}：合成失败要报错`);
-    assert.match(String(r.content[0].text), /失败/);
-  }
+    const r = await runIt({ name: 'qq_send_message', agent: { id: 'session-a' }, arguments: { key: 'private:1', message: '在的' } }, next);
+    assert.equal(was(), false);
+    assert.equal(r.isError, false);
+    const result = JSON.parse(r.value.content[0].text);
+    assert.equal(result.delivery, 'voice');
+    assert.equal(result.verified, true);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].body.text, '在的');
+  } finally { globalThis.fetch = failFetch; }
 });
 
-test('带记号的正文超过字数上限：不发语音，也不和文字重复发', async () => {
-  const runSelf = withMarker('self', 50);
-  const [next, was] = passed();
-  const long = '[[语音]] ' + '很长的句子'.repeat(120);
-  await runSelf({ name: 'qq_send_message', agent: { id: 'session-a' }, arguments: { key: 'private:1', message: long } }, next);
-  assert.equal(was(), true, '内容不适合念就退回文字');
+test('测试发送均经过 mock，不请求真实 API', () => { assert.ok(requests.length > 0); });
+
+test('旧 self 热配置自动迁移到正常 auto 概率模式', () => {
+  fs.writeFileSync(path.join(root, 'state', 'qzone-diary-config.json'), JSON.stringify({ voiceMode: 'self', voiceChance: 23 }));
+  mod.apply(ctx, { bridgeRoot: root });
+  const cfg = JSON.parse(fs.readFileSync(path.join(root, 'state', 'qzone-diary-config.json')));
+  assert.equal(cfg.voiceMode, 'auto');
+  assert.equal(cfg.voiceChance, 23);
+});
+
+
+const patchLiveConfig = async (patch) => {
+  const req = Readable.from([JSON.stringify(patch)]);
+  req.method = 'POST'; req.url = '/api/qzone-diary/config';
+  let status;
+  await ctx.webServer.route.handler(req, { writeHead(code) { status = code; }, end() {} });
+  assert.equal(status, 200);
+};
+
+test('100改10后发送出口立即按10重新判定，不复用旧命中', async () => {
+  const runIt = applyAs('auto', 100);
+  const pre = handlers.get('agent/pre-step').at(-1);
+  await pre({ agent: { id: 'session-a' }, turn: 50 }, async () => ({ kind: 'enter', messages: [] }));
+  await patchLiveConfig({ voiceChance: 10 });
+  const old = Math.random; Math.random = () => 0.9;
+  try {
+    const [next, was] = passed();
+    await runIt({ name: 'qq_send_message', agent: { id: 'session-a' }, arguments: { key: 'private:1', message: '普通文字' } }, next);
+    assert.equal(was(), true);
+  } finally { Math.random = old; }
+});
+
+test('同一turn的新QQ来信重掷，语音提示注入不重复掷骰', async () => {
+  const runIt = applyAs('auto', 10);
+  const pre = handlers.get('agent/pre-step').at(-1);
+  const event = handlers.get('session/event').filter(fn => fn.name === 'voiceEventHandler').at(-1);
+  assert.ok(event);
+  const old = Math.random; let count = 0;
+  Math.random = () => (++count === 1 ? 0.01 : 0.9);
+  try {
+    const payload = { agent: { id: 'session-a' }, turn: 60 };
+    await pre(payload, async () => ({ kind: 'enter', messages: [] }));
+    event({ id: 'session-a' }, { type: 'user/message', data: { source: { kind: 'voice-chat' } } });
+    await pre(payload, async () => ({ kind: 'enter', messages: [] }));
+    assert.equal(count, 1);
+    event({ id: 'session-a' }, { type: 'user/message', data: { source: { kind: 'user' } } });
+    await pre(payload, async () => ({ kind: 'enter', messages: [] }));
+    assert.equal(count, 2);
+    const [next, was] = passed();
+    await runIt({ name: 'qq_send_message', agent: { id: 'session-a' }, arguments: { key: 'private:1', message: '第二次回复' } }, next);
+    assert.equal(was(), true);
+  } finally { Math.random = old; }
 });

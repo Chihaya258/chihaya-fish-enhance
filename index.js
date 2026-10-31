@@ -47,8 +47,8 @@ export const Config = z.object({
   // —— 语音聊天（Breeze Blue 现场合成 → QQ 语音条）——
   voiceEnabled: z.boolean().default(false).description('语音聊天总开关：关着就永远只发字'),
   voiceDryRun: z.boolean().default(true).description('语音试运行：掷中只合成记账、不真发（先看几轮再关）'),
-  voiceMode: z.union([z.const('auto'), z.const('self'), z.const('after')]).default('auto')
-    .description('怎么发语音：auto=掷中的那一轮，这条回复直接变成语音条（替掉文字）；self=AI 想发就发，正文带 [[语音]] 记号就连语音，不带就打字（概率只做参考）；after=先正常打字，再补一条语音（会多出一条）'),
+  voiceMode: z.union([z.const('auto'), z.const('after')]).default('auto')
+    .description('怎么发语音：auto=掷中的那一轮，这条回复直接变成语音条（替掉文字）；after=先正常打字，再补一条语音（会多出一条）'),
   voiceChance: z.number().step(1).min(0).max(100).default(30).description('全局语音概率（%）：每次轮到自己说话，有这么大的机会改用语音'),
   voiceTargetSessions: z.array(z.string()).default([]).description('对哪些 DSH 会话发语音；空 = 所有绑定了 QQ 的会话'),
   voiceApiBase: z.string().max(300).default(DEFAULT_BASE).description('Breeze Blue API 地址（填到 /v1 为止）'),
@@ -65,18 +65,6 @@ export const Config = z.object({
   voiceUseSpeakerBoost: z.boolean().default(true).description('增强音色相似度'),
   voiceKeepFiles: z.number().step(1).min(1).max(500).default(50).description('语音库保留最近多少个本插件生成的文件（qc-*.wav）'),
 });
-
-/** 从模型回复里找出「这条要发语音」的记号，并摘掉记号。 */
-export function extractSpeakMarker(text) {
-  const s = String(text ?? '');
-  // 模型常把记号写成全角括号、半角括号或【】，语气分隔符也常写错，这里都认
-  const re = /[\[【［]\s*[\[【［]?\s*(?:语音|聲音|声音|voice|speak|speech)\s*(?:[·•・:：\-—]\s*([^\]】］\n]{0,40}))?\s*[\]】］]\s*[\]】］]?/i;
-  const m = re.exec(s);
-  if (!m) return { speak: false, hint: '', text: s.trim() };
-  const hint = String(m[1] ?? '').trim();
-  const rest = s.replace(re, '').replace(/[ \t]+\n/g, '\n').replace(/[ \t]{2,}/g, ' ').trim();
-  return { speak: true, hint, text: rest };
-}
 
 /** 交给 Breeze 的表演指令：默认指令 + 说话风格 + 这一条的临时风格。 */
 export function composeInstructions(config, hint) {
@@ -207,6 +195,8 @@ export function apply(ctx, rawConfig) {
     } catch { migratedVoiceFromLegacy = false; }
   }
   const saveConfig = () => save(configPath, Object.fromEntries(HOT_KEYS.map(k => [k, config[k]])));
+  // 兼容已保存的旧独立模式，统一回到正常的概率接管。
+  if (config.voiceMode === 'self') config.voiceMode = 'auto';
   saveConfig();
 
   const initialState = { drafts: [], posts: [], lastAttemptAt: null, nextAttemptAt: null, lastError: null, pending: null };
@@ -786,15 +776,15 @@ export function apply(ctx, rawConfig) {
 
   function planVoiceTurn(sid, turn) {
     const cached = turnVoice.get(sid);
-    if (cached && cached.turn === turn) return cached;
+    if (cached && cached.turn === turn && cached.chance === config.voiceChance) return cached;
     if (!voiceUsable()) return null;
     const hit = rollVoice(config);
     if (!hit.speak) {
       if (typeof hit.roll === 'number' && hit.reason === undefined) vlog(`掷 ${hit.roll.toFixed(0)} ≥ ${hit.chance}% → 打字`);
-      turnVoice.set(sid, { turn, speak: false });
+      turnVoice.set(sid, { turn, chance: config.voiceChance, speak: false });
       return turnVoice.get(sid);
     }
-    turnVoice.set(sid, { hint: '', turn, speak: true, source: 'auto' });
+    turnVoice.set(sid, { hint: '', turn, chance: config.voiceChance, speak: true, source: 'auto' });
     vlog(`掷 ${hit.roll.toFixed(0)} < ${hit.chance}% → 这一轮用语音`);
     return turnVoice.get(sid);
   }
@@ -830,69 +820,50 @@ export function apply(ctx, rawConfig) {
     }
     const text = (Array.isArray(raw) ? raw.map(String).join('\n') : String(raw ?? '')).trim();
     if (!text) return next();
-    // ① AI 自己写的 [[语音]] 记号：只要总闸开着就发，完全不受概率限制
-    let parsed = extractSpeakMarker(text);
-    let byChoice = true;
-    // ② 没写记号：只有 voiceMode=auto 时，才轮到本轮的掷骰结果决定
-    if (!parsed.speak) {
-      byChoice = false;
-      if (config.voiceMode === 'self') return next();
-      const plan = turnVoice.get(sid) ?? planVoiceTurn(sid, `send:${exec.rootCallId || exec.callId}`);
-      if (!plan?.speak) return next();
-      parsed = { speak: true, hint: parsed.hint || '', text };
-    }
-    const ready = voiceReady(parsed.text);
+    // 只看本轮掷骰结果：掷中就接管/补发，没掷中就原样交给下游发文字
+    const plan = planVoiceTurn(sid, turnVoice.get(sid)?.turn ?? `send:${exec.rootCallId || exec.callId}`);
+    if (!plan?.speak) return next();
+    const hint = String(plan.hint || '');
+    const ready = voiceReady(text);
     if (!ready.ok) {
-      vlog(`发送出口：${ready.why} → ${byChoice ? '这条发文字（显式要语音但内容不适合）' : '保留文字'}`);
+      vlog(`发送出口：${ready.why} → 保留文字`);
       return next();
     }
     if (config.voiceDryRun) {
-      vlog(`试运行：QQ发送工具命中语音（${byChoice ? 'AI 自决' : '概率'}），不合成不改动文字（${key}）`);
+      vlog(`试运行：QQ发送工具命中语音，不合成不改动文字（${key}）`);
       return next();
     }
     if (exec.signal?.aborted) return toolFailure('语音发送已取消。');
-    // 补发模式只用于概率命中；AI 显式要语音时仍然只发语音条，不再重复发一遍文字
-    if (!byChoice && config.voiceMode === 'after') {
+    if (config.voiceMode === 'after') {
       const original = await next();
       if (original.isError) return original;
-      await speakOnce(key, ready.text, '发送工具补发', parsed.hint || '', exec.signal);
+      await speakOnce(key, ready.text, '发送工具补发', hint, exec.signal);
       return original;
     }
-    const reason = byChoice ? 'AI自决:[[语音]]' : `发送工具:${name}`;
-    vlog(`发送出口已接管 ${name}（${key}，${[...ready.text].length}字，${byChoice ? 'AI 自决' : '概率命中'}），正在现场合成`);
-    const sent = await speakOnce(key, ready.text, reason, parsed.hint || '', exec.signal);
+    vlog(`发送出口已接管 ${name}（${key}，${[...ready.text].length}字，概率命中），正在现场合成`);
+    const sent = await speakOnce(key, ready.text, `发送工具:${name}`, hint, exec.signal);
     if (!sent.ok) return toolFailure(`现场合成或发送失败：${sent.error}。未发送文字，也未报告成功。`);
-    return toolSuccess({ ok: true, key, sent: 1, failed: 0, delivery: 'voice', byChoice, messageId: sent.messageId, verified: sent.verified, file: sent.file });
+    return toolSuccess({ ok: true, key, sent: 1, failed: 0, delivery: 'voice', messageId: sent.messageId, verified: sent.verified, file: sent.file });
   }
 
   // 提示注入：走 agent/pre-step（可持久化的普通 user 消息，不 append 新的 session 事件类型）
   const VOICE_STYLE_RULES = '话要短、要顺口、像平时说话，别念 markdown、链接、编号、代码或任何符号表情；分点罗列的内容改写成一两句话。';
   const voiceTip = () => `【语音聊天】你仍照常调用 QQ 发消息工具（qq_send_message 等），插件会在发送出口将正文现场合成为语音，不必自己合成、找音频文件。这一轮轮到你说的话会以语音条发出去，用户听到的是声音，所以${VOICE_STYLE_RULES}`;
-  const voiceSelfTip = () => `【语音聊天】这一轮你可以自己决定用不用语音：想用语音说话时，照常调用 QQ 发消息工具，并在正文里写上 [[语音]]（也可以写 [[语音·这一条的语气]] 指定语气，比如 [[语音·压低声音]]）。带上这个记号就一定发语音，不受发送概率限制——真的想让她听到你的声音（撒娇、哄人、语气比字更能表达的时候）就用它。不想用语音就别写记号，正常打字。用语音时${VOICE_STYLE_RULES}`;
   const voicePreStep = async ({ agent, turn, signal }, next) => {
     const decision = await next();
     if (decision.kind === 'reject' || signal?.aborted) return decision;
     try {
       const sid = String(agent?.id ?? '');
-      if (!sid || !voiceTarget(sid)) return decision;
-      if (config.voiceMode === 'self') {
-        if (internalTurns.has(sid)) { turnVoice.delete(sid); return decision; }
-        return {
-          ...decision,
-          messages: [...decision.messages, createUserMessage({
-            content: [{ type: 'text', text: voiceSelfTip() }],
-            source: { kind: 'voice-chat', form: 'notice', summary: '想用语音说话就写 [[语音]]' },
-          })],
-        };
-      }
-      if (config.voiceMode !== 'auto') return decision;
+      if (disposed || !voiceUsable() || !sid || !voiceTarget(sid)) return decision;
       if (internalTurns.has(sid)) { turnVoice.delete(sid); return decision; }
-      if (!planVoiceTurn(sid, turn)?.speak) return decision;
+      const plan = planVoiceTurn(sid, turn);
+      // 没掷中就不提语音，模型按普通文字回复
+      if (config.voiceMode !== 'auto' || !plan?.speak) return decision;
       return {
         ...decision,
         messages: [...decision.messages, createUserMessage({
           content: [{ type: 'text', text: voiceTip() }],
-          source: { kind: 'voice-chat', form: 'notice', summary: '这一轮说的话会变成语音' },
+          source: { kind: 'voice-chat', form: 'notice', summary: '这一轮用语音回复' },
         })],
       };
     } catch { return decision; }
@@ -906,8 +877,11 @@ export function apply(ctx, rawConfig) {
       if (!sid || !voiceTarget(sid)) return;
       if (event.type === 'user/message') {
         const kind = String(event.data?.source?.kind ?? event.data?.message?.source?.kind ?? '');
+        if (kind === 'voice-chat') return; // 本插件注入的提示不算一条新来信
+        turnVoice.delete(sid); // 持续运行的 agent 可在同一 turn 内收到多条 QQ 来信
         if (INTERNAL_SOURCE.test(kind)) internalTurns.add(sid);
-      } else if (event.type === 'turn/end') {
+        else internalTurns.delete(sid);
+      } else if (event.type === 'turn/start' || event.type === 'turn/end') {
         turnVoice.delete(sid);
         internalTurns.delete(sid);
       }
@@ -990,7 +964,7 @@ export function apply(ctx, rawConfig) {
     lastFile: (voiceState.log || []).slice().reverse().map(l => /：([^\s：]+\.wav)$/.exec(l.text)).find(Boolean)?.[1] ?? '',
     consoleUrl: (() => { try { return voiceConsoleUrl(); } catch { return ''; } })(),
     migrated: migratedVoiceFromLegacy,
-    deliveryHook: 'qq-tools-v3',
+    deliveryHook: 'qq-tools-v6-probability-only',
     lastError: voiceState.lastError,
     log: (voiceState.log || []).slice(-15),
     today: (voiceState.log || []).filter(l => dayKey(l.at) === dayKey(Date.now()) && /语音已发/.test(l.text)).length,
