@@ -123,6 +123,15 @@ function load(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); }
   catch (error) { if (error.code === 'ENOENT' && fallback !== undefined) return fallback; throw error; }
 }
+function loadStorage(root, fileName, fallback) {
+  const file = path.join(root, 'state', fileName);
+  try {
+    if (!fs.existsSync(file)) return { value: fallback, file, invalid: false };
+    return { value: JSON.parse(fs.readFileSync(file, 'utf8')), file, invalid: false };
+  } catch (error) {
+    return { value: fallback, file, invalid: true, error };
+  }
+}
 function save(file, value) {
   const temporary = `${file}.${randomUUID()}.tmp`;
   fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
@@ -150,10 +159,18 @@ export function apply(ctx, rawConfig) {
     ctx.logger?.warn?.(`fish-enhance: bridgeRoot 需要绝对路径，收到「${cordisConfig.bridgeRoot}」，已先按未配置处理；请到设置页填写。`);
   }
 
-  const hotConfigPathOf = (root) => (root ? path.join(root, 'state/qzone-diary-config.json') : '');
-  /** 先读盘上的热配置，拿到用户填过的 bridgeRoot（默认值不再指向作者机器）。 */
+  const CONFIG_FILE = 'fish-enhance-config.json';
+  const STATE_FILE = 'fish-enhance-state.json';
+  const PROACTIVE_FILE = 'fish-enhance-proactive.json';
+  const VOICE_FILE = 'fish-enhance-voice.json';
+  const LEGACY_STORAGE_FILES = [
+    'qzone-diary-config.json', 'qzone-diary.json', 'qzone-proactive.json', 'qzone-voice.json',
+    'qzone-voice-migrated.json', 'qzone-tts.json', 'voice-chat-config.json', 'voice-chat.json',
+  ];
+  const hotConfigPathOf = (root) => (root ? path.join(root, 'state', CONFIG_FILE) : '');
+  /** 只读取新命名文件；旧命名文件视为错误，不参与恢复或迁移。 */
   function resolveRoot() {
-    const persisted = load(hotConfigPathOf(initialRoot), {});
+    const persisted = loadStorage(initialRoot, CONFIG_FILE, {}).value;
     return bridgeRootOf(persisted.bridgeRoot)
       || bridgeRootOf(cordisConfig.bridgeRoot)
       || initialRoot;
@@ -191,71 +208,51 @@ export function apply(ctx, rawConfig) {
     if (problems.length) ctx.logger?.warn?.(`fish-enhance: 桥接还没配好，功能暂时不可用 → ${problems.join('；')}`);
   }
 
-  // ── 语音聊天：从独立插件 chihaya-voice-chat 并进来 ──
-  // 它原来的配置在 state/voice-chat-config.json。这一步必须放在「本插件的配置合并」之前，
-  // 否则合并时会把默认值写进 persisted，再判断"有没有 voice*"就把迁移整个挡掉了。
-  let migratedVoiceFromLegacy = false;
-  const legacyVoicePath = path.join(bridgeRoot(), 'state/voice-chat-config.json');
-  const legacyDone = path.join(bridgeRoot(), 'state/qzone-voice-migrated.json');
-  const legacyVoice = (() => {
-    try { return fs.existsSync(legacyDone) ? null : load(legacyVoicePath, null); } catch { return null; }
-  })();
+  // ── 语音聊天：设置只从当前插件的新存储读取。 ──
+  const migratedVoiceFromLegacy = false;
 
   // ── 配置：cordis 默认 → 磁盘 JSON（旧字段映射）──
   const HOT_KEYS = ['publishEnabled', 'intervalHours', 'randomJitterMinutes', 'maxPerDay', 'maxChars', 'visibility', 'sourceKeys', 'adminSessionIds', 'prompt', 'proactiveEnabled', 'proactiveTargetSessions', 'proactiveIntervalMin', 'proactiveEvalEnabled', 'proactiveEvalShrink', 'proactiveChance', 'proactivePeakChance', 'proactivePeakTz', 'proactiveMissBonus', 'proactiveMissBonusMax', 'proactiveQuietStart', 'proactiveQuietEnd', 'proactiveNearMin', 'proactiveNearFactor', 'proactiveFarMin', 'proactiveFarFactor', 'proactiveCooldownMin', 'proactiveTriggerText', 'proactivePrompt', 'proactiveDryRun', 'proactiveEvalInfluence', 'proactiveMissFloorStreak', 'proactiveMissFloor', 'proactiveChanceCap',
     'voiceEnabled', 'voiceDryRun', 'voiceMode', 'voiceChance', 'voiceTargetSessions', 'voiceApiBase', 'voiceApiKey', 'voiceModelId', 'voiceVoiceId', 'voiceLanguageCode', 'voiceInstructions', 'voiceStyleProfile', 'voiceStylePresets', 'voiceMaxChars', 'voiceSpeed', 'voiceGuidanceScale', 'voiceUseSpeakerBoost', 'voiceKeepFiles'];
-  const persisted = load(bridgeFile('state/qzone-diary-config.json'), {});
+  const configStorage = loadStorage(currentRoot, CONFIG_FILE, {});
+  const persisted = configStorage.value;
   const config = {
     bridgeRoot: currentRoot,
     ...Object.fromEntries(HOT_KEYS.map(k => [k, persisted[k] ?? cordisConfig[k] ?? Config({})[k]])),
   };
-  if (legacyVoice && typeof legacyVoice === 'object') {
-    const pair = {
-      voiceEnabled: 'voiceEnabled', voiceDryRun: 'dryRun', voiceMode: 'voiceMode', voiceChance: 'voiceChance',
-      voiceTargetSessions: 'targetSessions', voiceApiBase: 'apiBase', voiceApiKey: 'apiKey',
-      voiceModelId: 'modelId', voiceVoiceId: 'voiceId', voiceLanguageCode: 'languageCode',
-      voiceInstructions: 'instructions', voiceStyleProfile: 'styleProfile', voiceStylePresets: 'stylePresets',
-      voiceMaxChars: 'maxChars', voiceSpeed: 'speed', voiceGuidanceScale: 'guidanceScale',
-      voiceUseSpeakerBoost: 'useSpeakerBoost', voiceKeepFiles: 'keepFiles',
-    };
-    for (const [target, source] of Object.entries(pair)) {
-      // 新页面上已经存过的值优先，没存过才搬旧的
-      if (legacyVoice[source] !== undefined && persisted[target] === undefined) {
-        persisted[target] = legacyVoice[source];
-        config[target] = legacyVoice[source];
-      }
-    }
-    // customModelId 是旧页面的「自定义模型名」，有值就以它为准
-    const custom = String(legacyVoice.customModelId || '').trim();
-    if (custom && persisted.voiceModelId === undefined) { persisted.voiceModelId = custom; config.voiceModelId = custom; }
-    // 写个标记文件（只是时间戳，不含密钥），下次启动不再搬
-    try {
-      fs.mkdirSync(path.dirname(legacyDone), { recursive: true });
-      fs.writeFileSync(legacyDone, JSON.stringify({ at: Date.now(), from: legacyVoicePath }));
-      migratedVoiceFromLegacy = true;
-    } catch { migratedVoiceFromLegacy = false; }
+  const stateStorage = loadStorage(currentRoot, STATE_FILE, { drafts: [], posts: [], lastAttemptAt: null, nextAttemptAt: null, lastError: null, pending: null });
+  const proactiveStorage = loadStorage(currentRoot, PROACTIVE_FILE, { lastEval: null, lastProactiveAt: null, nextProactiveAt: null, lastError: null, log: [], evaluatedSessions: {} });
+  const voiceStorage = loadStorage(currentRoot, VOICE_FILE, { log: [], lastError: null });
+  const legacyStorageFiles = currentRoot
+    ? LEGACY_STORAGE_FILES.map(file => path.join(currentRoot, 'state', file)).filter(file => fs.existsSync(file))
+    : [];
+  let storageWritable = !configStorage.invalid && !stateStorage.invalid && !proactiveStorage.invalid && !voiceStorage.invalid && legacyStorageFiles.length === 0;
+  for (const entry of [configStorage, stateStorage, proactiveStorage, voiceStorage]) {
+    if (entry.invalid) ctx.logger?.error?.(`fish-enhance: 新存储文件无法解析，保留原文件且禁止写入默认值：${entry.file} (${entry.error?.message || 'invalid JSON'})`);
   }
-  const statePath = () => bridgeFile('state/qzone-diary.json');
+  if (legacyStorageFiles.length) {
+    ctx.logger?.error?.(`fish-enhance: 检测到已废弃的 qzone 存储文件，按错误处理且不读取：${legacyStorageFiles.join(', ')}`);
+  }
+  const statePath = () => bridgeFile('state', STATE_FILE);
   const _savePayload = () => ({ bridgeRoot: currentRoot, ...Object.fromEntries(HOT_KEYS.map(k => [k, config[k]])) });
-  // 没配好或目录不可写时静默跳过：桥接不在，配置没地方落，不该拖垮插件加载。
-  const saveConfig = () => { try { if (ready()) save(bridgeFile('state/qzone-diary-config.json'), _savePayload()); } catch { /* 落盘失败不影响运行 */ } };
+  const saveConfig = () => { try { if (ready() && storageWritable) save(bridgeFile('state', CONFIG_FILE), _savePayload()); } catch (error) { storageWritable = false; ctx.logger?.error?.(`fish-enhance: 配置保存失败，停止后续写入：${error.message}`); } };
   // 兼容已保存的旧独立模式，统一回到正常的概率接管。
   if (config.voiceMode === 'self') config.voiceMode = 'auto';
   saveConfig();
 
   const initialState = { drafts: [], posts: [], lastAttemptAt: null, nextAttemptAt: null, lastError: null, pending: null };
-  let state = (() => { try { return ready() ? load(statePath(), initialState) : { ...initialState }; } catch { return { ...initialState }; } })();
+  let state = stateStorage.value;
   // 迁移旧 state（旧版本有 scheduleNext/activityLast 等字段）
   if (!Number.isFinite(state.lastAttemptAt)) state.lastAttemptAt = null;
   if (!Number.isFinite(state.nextAttemptAt)) state.nextAttemptAt = null;
   delete state.scheduleNext; delete state.activityLast; delete state.nextAt; delete state.scheduleHash;
 
   // ── 主动回复状态 ──
-  const proactiveStatePath = () => bridgeFile('state/qzone-proactive.json');
+  const proactiveStatePath = () => bridgeFile('state', PROACTIVE_FILE);
   const proactiveInitial = { lastEval: null, lastProactiveAt: null, nextProactiveAt: null, lastError: null, log: [], evaluatedSessions: {} };
-  let proactiveState = (() => { try { return ready() ? load(proactiveStatePath(), proactiveInitial) : { ...proactiveInitial }; } catch { return { ...proactiveInitial }; } })();
+  let proactiveState = proactiveStorage.value;
   if (!Array.isArray(proactiveState.log)) proactiveState.log = [];
-  const persistProactive = () => { try { if (ready()) save(proactiveStatePath(), proactiveState); } catch { /* 落不了盘不影响运行 */ } };
+  const persistProactive = () => { try { if (ready() && storageWritable) save(proactiveStatePath(), proactiveState); } catch (error) { storageWritable = false; ctx.logger?.error?.(`fish-enhance: 状态保存失败，停止后续写入：${error.message}`); } };
   const logProactive = (text) => {
     proactiveState.log.push({ at: Date.now(), text: String(text) });
     if (proactiveState.log.length > 60) proactiveState.log = proactiveState.log.slice(-60);
@@ -287,7 +284,7 @@ export function apply(ctx, rawConfig) {
   let proactiveMissStreak = 0; // 连着几次没掷中（先声明，status() 会读）
   const abort = new AbortController();
   let active = Promise.resolve();
-  const persist = () => { try { if (ready()) save(statePath(), state); } catch { /* 落不了盘不影响运行 */ } };
+  const persist = () => { try { if (ready() && storageWritable) save(statePath(), state); } catch (error) { storageWritable = false; ctx.logger?.error?.(`fish-enhance: 日记状态保存失败，停止后续写入：${error.message}`); } };
   const status = () => ({
     bridgeRoot: currentRoot,
     bridgeProblems: bridgeProblems(),
@@ -692,10 +689,10 @@ export function apply(ctx, rawConfig) {
   // 从独立插件 chihaya-voice-chat 并入；配置字段一律以 voice 开头。
   // ══════════════════════════════════════════════════════════════
   const VOICE_HISTORY_LIMIT = 40;
-  const voiceStatePath = () => bridgeFile('state/qzone-voice.json');
-  let voiceState = (() => { try { return ready() ? load(voiceStatePath(), { log: [], lastError: null }) : { log: [], lastError: null }; } catch { return { log: [], lastError: null }; } })();
+  const voiceStatePath = () => bridgeFile('state', VOICE_FILE);
+  let voiceState = voiceStorage.value;
   if (!Array.isArray(voiceState.log)) voiceState.log = [];
-  const persistVoice = () => { try { if (ready()) save(voiceStatePath(), voiceState); } catch { /* 落不了盘不影响运行 */ } };
+  const persistVoice = () => { try { if (ready() && storageWritable) save(voiceStatePath(), voiceState); } catch (error) { storageWritable = false; ctx.logger?.error?.(`fish-enhance: 状态保存失败，停止后续写入：${error.message}`); } };
   const vlog = (text) => {
     voiceState.log.push({ at: Date.now(), text: String(text).slice(0, 400) });
     if (voiceState.log.length > VOICE_HISTORY_LIMIT) voiceState.log = voiceState.log.slice(-VOICE_HISTORY_LIMIT);
@@ -1008,8 +1005,16 @@ export function apply(ctx, rawConfig) {
         checked: (config.voiceTargetSessions || []).some(s => sessionKey(s) === sessionKey(id)),
       });
     };
-    for (const [key, sid] of Object.entries(map)) add(key, sid);
-    try { for (const a of ctx.agents.list?.() ?? []) add(keyForSession(a?.id), a?.id); } catch {}
+    const liveSessions = currentWorkspaceSessions();
+    for (const [key, sid] of Object.entries(map)) {
+      if (liveSessions.has(sessionKey(sid))) add(key, sid);
+    }
+    try {
+      for (const a of ctx.agents.list?.() ?? []) {
+        const id = a?.id || a?.session?.id;
+        if (id && liveSessions.has(sessionKey(id))) add(keyForSession(id), id);
+      }
+    } catch {}
     return out;
   }
 
@@ -1090,23 +1095,30 @@ export function apply(ctx, rawConfig) {
     } catch {}
     return '';
   }
-  // 盘上的会话 id（没打开标签页也在；子智能体滤掉）
-  function scanDiskSessions() {
-    const out = [];
+  // 当前工作区的会话注册表是唯一候选来源；不扫描全局磁盘历史。
+  function currentWorkspaceSessions() {
+    const out = new Set();
     try {
-      const dir = process.env.DSH_HOME || path.join(homedir(), '.dsh');
-      const 会话目录 = path.join(dir, 'storages', 'session_projcache', 'sessions');
-      for (const 名 of fs.readdirSync(会话目录)) {
-        if (!String(名).endsWith('.json')) continue;
-        const id = String(名).slice(0, -5);
-        try {
-          const 记 = JSON.parse(fs.readFileSync(path.join(会话目录, 名), 'utf8'));
-          const rows = (记 && 记.record && 记.record.rows) || {};
-          if (rows.subagent && rows.subagent.val && rows.subagent.val.identity) continue;
-          out.push(id);
-        } catch {}
+      const ss = ctx.get('sessions');
+      let list = [];
+      if (ss) {
+        if (typeof ss.list === 'function') list = ss.list() || [];
+        else if (ss.list && typeof ss.list.getSnapshot === 'function') {
+          const snap = ss.list.getSnapshot() || {};
+          list = Array.isArray(snap.items) ? snap.items : Object.values(snap.byId || {});
+        }
+        if (!list.length && typeof ss.getSnapshot === 'function') {
+          const snap = ss.getSnapshot() || {};
+          list = Array.isArray(snap.items) ? snap.items : Object.values(snap.byId || {});
+        }
+      }
+      for (const s of list) {
+        const id = s && (s.id || s.sessionId);
+        if (id) out.add(sessionKey(id));
       }
     } catch {}
+    const archived = archivedIds();
+    for (const id of archived) out.delete(sessionKey(id));
     return out;
   }
   // 会话清单：设置页「主动回复目标会话」勾选列表
@@ -1138,15 +1150,7 @@ export function apply(ctx, rawConfig) {
       }
       for (const s of 活们) 收(s && (s.id || s.sessionId));
     } catch {}
-    // ② 盘上的（关掉标签页也还在）
-    for (const id of scanDiskSessions()) 收(id);
-    // ③ 兜底：活着的 agent
-    try {
-      if (ctx.agents && typeof ctx.agents.list === 'function') {
-        for (const a of ctx.agents.list() || []) 收(a && (a.id || (a.session && a.session.id)));
-      }
-    } catch {}
-
+    // 历史磁盘会话不属于当前候选，避免混入其他工作区和已删除会话。
     const 勾着 = new Set((config.proactiveTargetSessions || []).map(sessionKey));
     const 归档 = new Set();
     try {
@@ -1157,7 +1161,7 @@ export function apply(ctx, rawConfig) {
     for (const id of ids) {
       const 是归档 = 归档.has(sessionKey(id));
       const 已勾 = 勾着.has(sessionKey(id));
-      if (是归档 && !已勾) continue; // 没勾的归档会话不列
+      if (是归档) continue;
       const agent = findAgent(id);
       out.push({
         id,

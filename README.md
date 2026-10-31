@@ -106,10 +106,12 @@ Web 设置页按功能分区，后续可继续添加更多机器人能力。
 | `config.json` | 桥接配置（只读） |
 | `state/social-v2.json` | 素材来源：机器人近期发言（只读） |
 | `state/sessions.json` | 会话映射，用于鉴权（只读） |
-| `state/qzone-diary.json` | 日记状态：草稿、已发布、下次尝试时间、pending |
-| `state/qzone-diary-config.json` | 热配置（设置页改动的持久化，旧字段自动映射） |
-| `state/qzone-voice.json` | 语音聊天的发送记录与最近错误 |
-| `state/voice-chat-config.json` | 旧独立插件 `chihaya-voice-chat` 的配置（首次启动按 `voice*` 字段搬一次，可删） |
+| `state/fish-enhance-state.json` | 日记状态：草稿、已发布、下次尝试时间、pending |
+| `state/fish-enhance-config.json` | 热配置（设置页改动的持久化，旧字段自动映射） |
+| `state/fish-enhance-proactive.json` | 主动回复状态与运行记录 |
+| `state/fish-enhance-voice.json` | 语音聊天的发送记录与最近错误 |
+| `state/qzone-*.json` | 已废弃文件；检测到即按错误处理，不读取、不迁移、不覆盖；旧文件必须移出 `state/` 目录 |
+| `state/voice-chat-config.json` | 已废弃文件；不读取、不迁移、不覆盖 |
 | `audio/qc-*.wav` | 合成出来的语音（只留 `voiceKeepFiles` 条） |
 
 ---
@@ -203,10 +205,10 @@ ln -sfn /root/.dsh/plugins/chihaya-fish-enhance node_modules/chihaya-fish-enhanc
 
 ## 安全说明
 
-- `voiceApiKey` 会以明文写进 `{bridgeRoot}/state/qzone-diary-config.json`（后端要靠它发请求，无法避免落盘）。
+- `voiceApiKey` 会以明文写进 `{bridgeRoot}/state/fish-enhance-config.json`（后端要靠它发请求，无法避免落盘）。
 - **读取方向全部打了码**：`GET /api/qzone-diary/config` 与 `/voice/key` 只返回 `***`，判断有没有配过请看 `hasKey`。
 - 设置页的密钥框是空的，留空表示不改，不会把 `***` 写回磁盘。
-- 分享这个插件给别人时，注意不要连 `state/qzone-diary-config.json` 一起打包。
+- 分享这个插件给别人时，注意不要连 `state/fish-enhance-config.json` 一起打包。
 
 ---
 

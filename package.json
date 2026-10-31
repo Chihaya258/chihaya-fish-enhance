@@ -36,6 +36,6 @@
     }
   },
   "scripts": {
-    "test": "node --test tts.test.js outgoing.test.js"
+    "test": "node --test tts.test.js outgoing.test.js session-list.test.js"
   }
 }

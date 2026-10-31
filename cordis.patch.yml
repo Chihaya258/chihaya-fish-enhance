@@ -2,7 +2,7 @@
     - id: qzone-diary
       name: 'chihaya-fish-enhance'
       config:
-        bridgeRoot: ''
+        bridgeRoot: /opt/qq-bridge
         publishEnabled: false
         intervalHours: 8
         randomJitterMinutes: 180

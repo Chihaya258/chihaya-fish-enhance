@@ -152,14 +152,20 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
         hint ? h(Hint, null, hint) : null);
     }
     // 纯数字框（宽 140，独立一行）
-    function NumInput({ value, min, max, onCommit, unit }) {
+    function NumInput({ value, min, max, onCommit, unit, percent }) {
+      const isPercent = percent || unit === '%' || unit === '百分点';
+      const [draft, setDraft] = React.useState(value == null ? '' : String(value));
+      React.useEffect(() => {
+        setDraft(value == null ? '' : String(value));
+      }, [value]);
       return h('div', { 'data-qzd-inline': '' },
         h('input', {
-          'data-qzd-input': '', 'data-qzd-num': '', type: 'number', min, max,
-          value: value == null ? '' : value,
-          onChange: (e) => onCommit(e.target.value),
+          'data-qzd-input': '', 'data-qzd-num': '', type: 'number', min, max: isPercent ? undefined : max,
+          value: isPercent ? draft : (value == null ? '' : value),
+          onChange: (e) => isPercent ? setDraft(e.target.value) : onCommit(e.target.value),
           onBlur: (e) => {
             const n = Math.max(min, Math.min(max, Number(e.target.value) || min));
+            if (isPercent) setDraft(String(n));
             onCommit(String(n));
           },
         }),
@@ -562,7 +568,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
               hint: '每没掷中一次，下一次命中线加这么多（默认 10）。填 0 = 关掉这个功能（一分都不加）。',
             },
               h(NumInput, {
-                value: cfg.proactiveMissBonus, min: 0, max: 100,
+                value: cfg.proactiveMissBonus, min: 0, max: 100, percent: true,
                 onCommit: (v) => patch({ proactiveMissBonus: Number(v) }, '没中加成'),
               })),
             h(Field, {
@@ -570,7 +576,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
               hint: '加成最多加到这么多（默认 40）。',
             },
               h(NumInput, {
-                value: cfg.proactiveMissBonusMax, min: 0, max: 100,
+                value: cfg.proactiveMissBonusMax, min: 0, max: 100, percent: true,
                 onCommit: (v) => patch({ proactiveMissBonusMax: Number(v) }, '加成上限'),
               })),
             h(Para, null, '掷中（含试运行掷中）就清零，从头开始；连着没中就一次一次往上加，加到上限为止。'),
@@ -587,7 +593,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
               hint: '触发保底后命中线不低于此值（默认 65）。不会突破时机因子：对方刚说完话时照样打折，避免硬闯打断。',
             },
               h(NumInput, {
-                value: cfg.proactiveMissFloor ?? 65, min: 0, max: 100,
+                value: cfg.proactiveMissFloor ?? 65, min: 0, max: 100, percent: true,
                 onCommit: (v) => patch({ proactiveMissFloor: Number(v) }, '保底命中线'),
               })),
             h(Field, {
@@ -595,7 +601,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
               hint: '命中线再高也封顶到这个值（默认 95），防止出现「必然开口」。',
             },
               h(NumInput, {
-                value: cfg.proactiveChanceCap ?? 95, min: 1, max: 100,
+                value: cfg.proactiveChanceCap ?? 95, min: 1, max: 100, percent: true,
                 onCommit: (v) => patch({ proactiveChanceCap: Number(v) }, '命中线上限'),
               })),
             h(Para, null, '这两格只影响自动的定时掷骰；手动按钮（演练/真发）不掷骰子，也不动这个计数器。'),
@@ -631,7 +637,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
               hint: '分数 0 → 间隔不缩；分数 1 → 间隔缩到基础间隔的 (100 − 这个数)%。默认 70（即最快缩到 30%）。',
             },
               h(NumInput, {
-                value: cfg.proactiveEvalShrink ?? 70, min: 0, max: 100,
+                value: cfg.proactiveEvalShrink ?? 70, min: 0, max: 100, percent: true,
                 onCommit: (v) => patch({ proactiveEvalShrink: Number(v) }, '缩短幅度'),
               })),
             h(Field, {
@@ -639,7 +645,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
               hint: '以 0 分为基线向上抬：0 分 → ×1.00（完全不改变命中线）；分数越高抬得越多，1 分 → ×(1 + 幅度%)。默认 50，即 1 分抬到 1.5 倍。把这格填 0 → 评估只影响间隔，完全不动命中线。',
             },
               h(NumInput, {
-                value: cfg.proactiveEvalInfluence ?? 50, min: 0, max: 100,
+                value: cfg.proactiveEvalInfluence ?? 50, min: 0, max: 100, percent: true,
                 onCommit: (v) => patch({ proactiveEvalInfluence: Number(v) }, '评估影响'),
               })),
             h(Ok, null, '√ 同一轮对话只评一次：对方回复之前不会再评，对方一开口就重新计一次。'),
@@ -683,7 +689,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
               hint: '每轮掷一个 0~100 的数，掷到命中线以下才开口；掷在上面就不开。这是峰时的基础命中线（峰时 = 周一~周五 9:00~12:00、14:00~18:00，贵）。默认 20 —— 贵的时候少开口。',
             },
               h(NumInput, {
-                value: cfg.proactivePeakChance, min: 0, max: 100,
+                value: cfg.proactivePeakChance, min: 0, max: 100, percent: true,
                 onCommit: (v) => patch({ proactivePeakChance: Number(v) }, '峰时命中线'),
               })),
             h(Field, {
@@ -691,7 +697,7 @@ select[data-qzd-input]{width:auto;min-width:150px;max-width:230px;flex:0 0 auto;
               hint: '这是谷时的基础命中线（其余全是谷时：午休 12:00~14:00、18:00 到次日 9:00、周六周日全天，便宜）。默认 50。',
             },
               h(NumInput, {
-                value: cfg.proactiveChance, min: 0, max: 100,
+                value: cfg.proactiveChance, min: 0, max: 100, percent: true,
                 onCommit: (v) => patch({ proactiveChance: Number(v) }, '谷时命中线'),
               })),
             h(Field, {

@@ -39,14 +39,14 @@ const mod = await import('./index.js');
 
 /** 换个发送方式/概率来测。 */
 const applyAs = (mode, chance) => {
-  fs.rmSync(path.join(root, 'state', 'qzone-diary-config.json'), { force: true });
+  fs.rmSync(path.join(root, 'state', 'fish-enhance-config.json'), { force: true });
   mod.apply(ctx, {
     bridgeRoot: root, voiceEnabled: true, voiceDryRun: false, voiceMode: mode, voiceChance: chance,
     voiceApiKey: 'bad-key', voiceVoiceId: 'voc_test', voiceTargetSessions: ['session-a'],
   });
   // 本插件把配置原样落盘（含 cordis 里传进来的值），每次 apply 等于重开一个实例：
   // 先把上一轮写下的 state 清掉，免得这次的 voiceMode 被上一轮的 auto 挡掉。
-  fs.rmSync(path.join(root, 'state', 'qzone-diary-config.json'), { force: true });
+  fs.rmSync(path.join(root, 'state', 'fish-enhance-config.json'), { force: true });
   // 每次 apply 都会再挂一个钩子，老钩子（dispose 没被 ctx.effect 调过）还在数组里，
   // 所以取最新的那个——也就是本次 apply 挂上的。
   const hook = (handlers.get('tools/execute') ?? []).at(-1);
@@ -106,7 +106,7 @@ test('概率 100 无记号：仍接管合成', async () => {
 
 test('总开关关闭：不提示语音且不绕过总闸', async () => {
   applyAs('auto', 0);
-  fs.rmSync(path.join(root, 'state', 'qzone-diary-config.json'), { force: true });
+  fs.rmSync(path.join(root, 'state', 'fish-enhance-config.json'), { force: true });
   mod.apply(ctx, { bridgeRoot: root, voiceEnabled: false, voiceApiKey: 'bad-key', voiceVoiceId: 'voc_test' });
   const original = { kind: 'enter', messages: [] };
   const r = await handlers.get('agent/pre-step').at(-1)({ agent: { id: 'session-a' }, turn: 6 }, async () => original);
@@ -140,10 +140,10 @@ test('掷中：接管合成并发送，只发一条语音', async () => {
 
 test('测试发送均经过 mock，不请求真实 API', () => { assert.ok(requests.length > 0); });
 
-test('旧 self 热配置自动迁移到正常 auto 概率模式', () => {
-  fs.writeFileSync(path.join(root, 'state', 'qzone-diary-config.json'), JSON.stringify({ voiceMode: 'self', voiceChance: 23 }));
+test('旧 self 模式值在新配置文件内规范化到 auto', () => {
+  fs.writeFileSync(path.join(root, 'state', 'fish-enhance-config.json'), JSON.stringify({ voiceMode: 'self', voiceChance: 23 }));
   mod.apply(ctx, { bridgeRoot: root });
-  const cfg = JSON.parse(fs.readFileSync(path.join(root, 'state', 'qzone-diary-config.json')));
+  const cfg = JSON.parse(fs.readFileSync(path.join(root, 'state', 'fish-enhance-config.json')));
   assert.equal(cfg.voiceMode, 'auto');
   assert.equal(cfg.voiceChance, 23);
 });
